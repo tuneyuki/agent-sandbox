@@ -1,0 +1,30 @@
+# ローカル開発用。GCP リソース無しで動く（状態はローカルボリューム、履歴はメモリ）。
+#   ANTHROPIC_API_KEY=sk-ant-... docker compose up --build
+#   → http://localhost:8080
+# Vertex AI を使う場合は ANTHROPIC_API_KEY の代わりに下のコメントを外し、
+# gcloud auth application-default login 済みの ADC をマウントする。
+services:
+  runner:
+    build: ./runner
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # CLAUDE_CODE_USE_VERTEX: "1"
+      # CLOUD_ML_REGION: global
+      # ANTHROPIC_VERTEX_PROJECT_ID: your-project
+      # GOOGLE_APPLICATION_CREDENTIALS: /adc.json
+      CLAUDE_MODEL: ${CLAUDE_MODEL:-claude-opus-5-5}
+      LOCAL_STATE_DIR: /state
+    volumes:
+      - runner-state:/state
+      # - ${HOME}/.config/gcloud/application_default_credentials.json:/adc.json:ro
+  gateway:
+    build: ./gateway
+    ports: ["8080:8080"]
+    environment:
+      AUTH_MODE: none
+      STORE: memory
+      RUNNER_URL: http://runner:8080
+      RUNNER_AUTH: none
+    depends_on: [runner]
+volumes:
+  runner-state:

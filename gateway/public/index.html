@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Agent Sandbox</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <aside id="sidebar">
+    <button id="new-chat">＋ 新しいチャット</button>
+    <ul id="sessions"></ul>
+    <button id="set-token" class="subtle">API トークン設定</button>
+  </aside>
+  <main>
+    <div id="messages"><p class="empty">メッセージを送ると、サンドボックス内の Claude Code が作業します。</p></div>
+    <form id="composer">
+      <textarea id="input" rows="3" placeholder="例: Python で FizzBuzz を書いて実行して (Ctrl+Enter で送信)"></textarea>
+      <button id="send" type="submit">送信</button>
+      <button id="stop" type="button" hidden>停止</button>
+    </form>
+  </main>
+  <script src="app.js" type="module"></script>
+</body>
+</html>
