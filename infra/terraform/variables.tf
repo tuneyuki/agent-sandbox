@@ -39,9 +39,13 @@ variable "max_agent_turns" {
 }
 
 variable "turn_timeout_seconds" {
-  description = "1 ターン（ユーザー 1 メッセージ）あたりの最大実行時間。Cloud Run の上限は 3600 秒"
+  description = "1 ターン（ユーザー 1 メッセージ）のエージェント実行時間の上限。Cloud Run Jobs の上限（24 時間）から復元・保存の余裕 15 分を引いた値まで"
   type        = number
   default     = 1800
+  validation {
+    condition     = var.turn_timeout_seconds >= 60 && var.turn_timeout_seconds <= 85500
+    error_message = "turn_timeout_seconds must be between 60 and 85500"
+  }
 }
 
 variable "runner_cpu" {
@@ -56,13 +60,8 @@ variable "runner_memory" {
   default     = "8Gi"
 }
 
-variable "runner_min_instances" {
-  type    = number
-  default = 0
-}
-
-variable "runner_max_instances" {
-  description = "同時に実行できるターン数の上限（= コスト上限の目安）"
+variable "max_running_turns" {
+  description = "全セッション合計で同時に実行するターン数の上限（0 で無制限）。コストの歯止め"
   type        = number
   default     = 10
 }

@@ -20,14 +20,6 @@ resource "google_compute_subnetwork" "sandbox" {
   private_ip_google_access = true
 }
 
-resource "google_compute_subnetwork" "gateway" {
-  name                     = "agent-sandbox-gateway"
-  network                  = google_compute_network.sandbox.id
-  region                   = var.region
-  ip_cidr_range            = "10.10.1.0/24"
-  private_ip_google_access = true
-}
-
 # *.googleapis.com / *.run.app を private.googleapis.com (199.36.153.8/30) に向ける
 resource "google_dns_managed_zone" "googleapis" {
   name       = "agent-sandbox-googleapis"
@@ -56,7 +48,7 @@ resource "google_dns_record_set" "googleapis_cname" {
   rrdatas      = ["private.googleapis.com."]
 }
 
-# Gateway → Runner (internal ingress) も Private Google Access 経由で到達させる
+# Runner → Gateway（進捗報告）も Private Google Access 経由で到達させる
 resource "google_dns_managed_zone" "run_app" {
   name       = "agent-sandbox-run-app"
   dns_name   = "run.app."

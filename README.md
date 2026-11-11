@@ -10,24 +10,26 @@ API で指示とファイルを渡すと、GCP 上の隔離された環境で **
 |---|---|---|
 | **セッション**（= 1 つのチャット） | Firestore の `sessions/{id}` + GCS の `sessions/{id}/` フォルダ | ユーザーが消すまで（ファイルは既定 30 日） |
 | **ターン**（= ユーザーの 1 メッセージ） | Firestore の `sessions/{id}/turns/{turnId}` | セッションと同じ |
-| **サンドボックス**（Claude Code が動く場所） | Runner（Cloud Run）のコンテナ 1 つ | **1 ターンの間だけ借りる** |
+| **サンドボックス**（Claude Code が動く場所） | Runner = **Cloud Run Jobs の 1 実行** | **1 ターンの間だけ借りる** |
 
-Runner は状態を持ちません。ターンのたびに「セッションフォルダを展開 → Claude Code 実行 → 差分を書き戻す → 消す」を行うので、どのコンテナに当たっても同じセッションの続きが実行できます。
+Runner は状態を持ちません。ターンのたびに「セッションフォルダを展開 → Claude Code 実行 → 差分を書き戻す → 消す」を行うので、どの実行でも同じセッションの続きができます。
+
+ターンは HTTP 接続から切り離されています。Gateway はメッセージを受けると **Cloud Run Jobs の実行を 1 つ起動** するだけで、Runner は進捗を Gateway に報告し、Gateway がそれを Firestore に書きます。クライアントは Firestore に溜まったイベントを SSE で受け取るので、接続が切れても作業は止まらず、`Last-Event-ID` で続きから受け取り直せます。
 
 ```
  チャットボットのバックエンド
-        │  HTTPS (+SSE)
-        ▼
- ┌─────────────────────────────┐       ┌───────────────────────────────────────────┐
- │ Gateway (Cloud Run)          │──────▶│ Runner (Cloud Run, 内部専用, concurrency=1)│
- │ ・認証（IAM / Bearer）         │ NDJSON│  1. sessions/{id}/ を /sandbox に展開        │
- │ ・セッション/ターン管理         │◀──────│  2. Claude Code 実行（cwd=/sandbox/workspace）│
- │ ・ファイル API                 │       │  3. 変更ファイルを書き戻し                     │
- │ ・セッション限定トークン発行     │       │  4. /sandbox を消去                          │
- └──────┬───────────────┬──────┘       └──────┬──────────────────────┬─────────────┘
-        │               │                     │ sessions/{id}/ 限定      │
-        ▼               ▼                     ▼ トークン                  ▼
-   Firestore      GCS バケット（1 つ）  ◀──────┘                     Vertex AI (Claude)
+        │ ① POST /messages        ⑤ SSE（Last-Event-ID で再開可）
+        ▼                          ▲
+ ┌──────────────────────────────────┴┐  ② ジョブ実行   ┌────────────────────────────────────────┐
+ │ Gateway (Cloud Run)                │───────────────▶│ Runner (Cloud Run Jobs, 1 実行 = 1 ターン) │
+ │ ・認証（IAM / Bearer）              │                │  sessions/{id}/ を展開 → Claude Code 実行  │
+ │ ・セッション/ターン/イベント管理       │◀───────────────│  → 変更を書き戻し → 終了                    │
+ │ ・ファイル API                      │ ③ 進捗報告       └──────┬───────────────────────┬─────────┘
+ │ ・セッション限定トークン発行          │ （ターン専用トークン）    │ sessions/{id}/ 限定トークン │
+ └──────┬─────────────────┬──────────┘                       ▼                         ▼
+   ④ 書き込み│                 │                        GCS バケット（1 つ）         Vertex AI (Claude)
+        ▼                 └──────────────────────────────▶
+   Firestore
 ```
 
 ### 状態の置き場所
@@ -39,16 +41,23 @@ sessions/{sessionId}
   owner            x-user-id（エンドユーザー）
   title
   status           idle | running
-  lockedUntil      実行中ロックの期限（Gateway が落ちても自動解放）
+  activeTurnId     実行中のターン
+  lockedUntil      実行中ロックの期限。Runner の生存報告（20 秒ごと）で延長される
   claudeSessionId  Claude Code 側の会話 ID（resume 用、外には出さない）
   turnCount, totalCostUsd, createdAt, updatedAt
 sessions/{sessionId}/turns/{turnId}
-  input, attachments[], status (running|completed|failed|aborted)
+  input, attachments[], options
+  status           queued | running | completed | failed | aborted
   text             最終回答
-  events[]         ツール呼び出し・結果など（表示・監査用）
-  filesChanged     { added, modified, deleted }
-  costUsd, error, startedAt, finishedAt
+  filesChanged     { added, modified, deleted, deps }
+  cancelRequested  中断要求
+  tokenHash        Runner 認証用トークンのハッシュ
+  costUsd, error, lastSeq, startedAt, finishedAt
+sessions/{sessionId}/turns/{turnId}/events/{seq}
+  seq, type, json  イベント本体（SSE で流すもの。連番で再開できる）
 ```
+
+Runner が異常終了して生存報告が 3 分途絶えると、そのターンは `failed`（`runner stopped responding`）になり、ロックが外れます。
 
 **GCS**（ファイルの実体）。バケットは 1 つだけで、フォルダでセッションを分けます。
 
@@ -69,6 +78,7 @@ gs://{project}-agent-sandbox-state/
 - Runner のサービスアカウントには **バケット権限が一切ありません**（`roles/aiplatform.user` だけ）。
 - Gateway はターンごとに、[Credential Access Boundary](https://cloud.google.com/iam/docs/downscoping-short-lived-credentials) で **`sessions/{id}/` 配下だけ** に絞ったトークンを作って Runner に渡します。
 - エージェントがこのトークンを盗んでも、触れるのは自分のセッションのフォルダだけです。バケットを増やさずに、セッションごとにバケットがあるのと同じ分離になります。
+- Runner には Firestore の権限もありません。進捗報告は Gateway の `/internal` API に、**そのターン専用のトークン**（ハッシュだけを Firestore に保存）で送ります。ターンが終わるとトークンは使えなくなります。
 
 ## サンドボックスでのアプリ開発（Python / Node.js）
 
@@ -85,7 +95,7 @@ gs://{project}-agent-sandbox-state/
 
 **依存の引き継ぎ**: `node_modules/` と `.venv/` はファイル数が多いので、ファイル単位では同期しません。セッションごとに 1 つのアーカイブ（`sessions/{id}/.state/deps.tar.zst`）にまとめて保存します。中身が変わったときだけアップロードし直すので、次のターンでは再インストールなしでビルドやテストができます。`files_changed.deps` が `saved` / `unchanged` / `removed` / `too_large` のどれかで結果を示します。
 
-**実行**: ターンの中で、ビルドとテストに加えて Web サーバーの起動もできます（バックグラウンドで起動し、`curl` で確認する）。Bash のタイムアウトは既定 10 分・最大 30 分に延ばしてあります。ターンが終わると、エージェントが起動したプロセスはすべて停止します。
+**実行**: ターンの中で、ビルドとテストに加えて Web サーバーの起動もできます（バックグラウンドで起動し、`curl` で確認する）。ターンが終わると、エージェントが起動したプロセスはすべて停止します。
 
 ```bash
 curl -N -XPOST $URL/v1/sessions/$SID/messages "${H[@]}" -H 'content-type: application/json' -d '{
@@ -130,11 +140,25 @@ curl -N -XPOST $URL/v1/sessions/$SID/messages "${H[@]}" -H 'content-type: applic
 }
 ```
 
-`files`・`model`・`effort`・`system_prompt` は省略できます。`model` は `ALLOWED_MODELS` に含まれるものだけ有効です。応答は `text/event-stream` で、イベントは次のとおりです。
+`files`・`model`・`effort`・`system_prompt` は省略できます。`model` は `ALLOWED_MODELS` に含まれるものだけ有効です。
+
+応答には 2 つのモードがあります。どちらでもターンは裏で進み、**接続を切っても止まりません**。
+
+- **ストリーミング（既定）**: `text/event-stream` でイベントを流す。最初に `session` イベント（`turn_id` 入り）が来る。
+- **非同期**: `"async": true` を付けると、すぐに `202 { session_id, turn_id, events_url, turn_url }` を返す。
+
+| メソッド | パス | 説明 |
+|---|---|---|
+| `GET` | `/v1/sessions/:id/turns` | ターン一覧 |
+| `GET` | `/v1/sessions/:id/turns/:turnId` | ターンの状態（`status`, `text`, `filesChanged`, `costUsd` …） |
+| `GET` | `/v1/sessions/:id/turns/:turnId/events` | イベントの SSE。`Last-Event-ID` ヘッダーか `?after=<seq>` で続きから。`?stream=false` なら JSON 配列で返す |
+| `POST` | `/v1/sessions/:id/turns/:turnId/cancel` | 中断（20 秒以内に止まり、`aborted` になる） |
+
+SSE の各イベントには `id: <seq>` が付きます。`done` が届いたらそのターンは終わりです。それより前に接続が切れたら（長いターンでは Gateway の 1 接続の上限 60 分で切れる）、最後に受け取った `id` を `Last-Event-ID` にして `events` を呼び直してください。ブラウザの `EventSource` なら自動で再接続されます。
 
 | type | 内容 |
 |---|---|
-| `session` | `session_id`, `turn_id`, `attachments`（保存された添付のパス） |
+| `session` | `session_id`, `turn_id`, `attachments`, `events_url`（ストリーミングモードの最初だけ。`id` なし） |
 | `status` | `restoring` / `running` / `saving` |
 | `text_delta` | 回答テキストの差分（チャット表示用） |
 | `text` | 確定したテキストブロック |
@@ -143,16 +167,38 @@ curl -N -XPOST $URL/v1/sessions/$SID/messages "${H[@]}" -H 'content-type: applic
 | `result` | `ok`, `numTurns`, `durationMs`, `costUsd`（セッション累計の推定値） |
 | `files_changed` | `added` / `modified`（`path`, `size`, `url`）, `deleted`, `deps` |
 | `error` | `message` |
-| `done` | `turn_id`。ストリーム終了 |
+| `done` | `turn_id`, `status`（`completed` / `failed` / `aborted`）, `error`, `cost_usd`（このターンの分）。ストリーム終了 |
 
-同じセッションで同時に 2 ターンは走りません（2 つ目は 409）。
+同じセッションで同時に 2 ターンは走りません（2 つ目は 409）。全体の同時実行数が `max_running_turns` に達していると 429 を返します。
+
+### 時間の上限
+
+| 制限 | 既定値 | 変更方法 |
+|---|---|---|
+| 1 ターンの実行時間 | 30 分 | `turn_timeout_seconds`（最大 85500 秒 ≒ 23.75 時間。Cloud Run Jobs の上限 24 時間から、復元・保存用の 15 分を引いた値） |
+| 1 コマンド（Bash 1 回） | 既定 10 分 / 最大 30 分 | Runner の `BASH_DEFAULT_TIMEOUT_MS` / `BASH_MAX_TIMEOUT_MS` |
+| SSE の 1 接続 | 60 分 | Cloud Run の上限。再接続で続きを受け取る |
+| 1 ターン内でのやり取りの往復回数 | 50 | `max_agent_turns` |
+
+上限を超えたターンは `aborted`（`timeout`）になりますが、そこまでのファイルと依存は保存されます。「続けて」と送れば会話の続きとして再開できます。
 
 ```bash
 H=(-H "x-user-id: alice" -H "authorization: Bearer $TOKEN")   # iam モードなら ID トークン
 SID=$(curl -s -XPOST $URL/v1/sessions "${H[@]}" | jq -r .id)
 curl -XPUT $URL/v1/sessions/$SID/files/data/sales.csv "${H[@]}" --data-binary @sales.csv
+
+# ストリーミング
 curl -N -XPOST $URL/v1/sessions/$SID/messages "${H[@]}" -H 'content-type: application/json' \
   -d '{"input":"data/sales.csv を月別に集計して report.md にまとめて"}'
+
+# 非同期（長い作業向け）
+TID=$(curl -s -XPOST $URL/v1/sessions/$SID/messages "${H[@]}" -H 'content-type: application/json' \
+  -d '{"input":"テストが全部通るまで直して","async":true}' | jq -r .turn_id)
+curl -N $URL/v1/sessions/$SID/turns/$TID/events "${H[@]}"                        # 進捗を見る
+curl -N $URL/v1/sessions/$SID/turns/$TID/events "${H[@]}" -H 'Last-Event-ID: 42'  # 続きから
+curl -s $URL/v1/sessions/$SID/turns/$TID "${H[@]}" | jq .status                   # 状態だけ
+curl -XPOST $URL/v1/sessions/$SID/turns/$TID/cancel "${H[@]}"                     # 中断
+
 curl $URL/v1/sessions/$SID/files/report.md "${H[@]}"
 ```
 
@@ -188,8 +234,8 @@ PROJECT_ID=your-project AUTH_MODE=token ./scripts/deploy.sh
 | `claude_model` / `allowed_models` | `claude-opus-5-5` / Opus・Sonnet・Haiku | 既定モデルと、リクエストで選べるモデル |
 | `package_mirror` | `true` | npm / PyPI のミラー（Artifact Registry のリモートリポジトリ）を作って Runner から使う |
 | `runner_internet_access` | `false` | `true` で Runner から任意のインターネット（Web・GitHub など）に出られる |
-| `turn_timeout_seconds` | `1800` | 1 ターンの上限（Cloud Run の上限は 3600） |
-| `runner_max_instances` | `10` | 同時に実行できるターン数（コストの上限にもなる） |
+| `turn_timeout_seconds` | `1800` | 1 ターンの上限（最大 85500） |
+| `max_running_turns` | `10` | 全セッション合計で同時に実行するターン数（コストの歯止め。0 で無制限） |
 | `runner_cpu` / `runner_memory` | `4` / `8Gi` | サンドボックス 1 つあたりのリソース（Cloud Run のディスクはメモリ上にあるので、`node_modules` などもメモリを使う） |
 | `state_retention_days` | `30` | GCS 上のセッションフォルダの保持期間 |
 
@@ -197,12 +243,13 @@ PROJECT_ID=your-project AUTH_MODE=token ./scripts/deploy.sh
 
 Claude Code の操作を承認する人がいないので、「何をされても被害が限られる」ことを環境側で担保しています。
 
-- **コンテナ**: Runner は Cloud Run（gen2）で `concurrency=1`。ターンごとに `/sandbox` を消去し、非 root で実行する。バックグラウンド実行は無効（`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`）。
+- **コンテナ**: Runner は Cloud Run Jobs（gen2）。1 実行 = 1 ターンで、終わればコンテナごと消える。非 root で実行する。バックグラウンド実行は無効（`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`）。
 - **ネットワーク**: Runner の通信はすべて VPC を通り、既定では Private Google Access（Vertex AI・GCS・Artifact Registry のパッケージミラー）以外への外向き通信を拒否する。
 - **プロセス**: ターンの最後に、エージェントが起動して残したプロセスを止める（環境変数の印と cwd で判別）。
 - **権限**: Runner の SA は Vertex AI の利用権限と、パッケージミラーの読み取り権限だけ。GCS はセッション限定トークン経由でしか触れない。API キーもサンドボックス内に置かない（Vertex AI を SA で呼ぶ）。
 - **ツール**: `permissionMode: "dontAsk"` + `allowedTools`。許可リスト外のツールは自動で拒否する。`settingSources: []` で外部の設定ファイルを読まない。
-- **Runner への入口**: `INGRESS_TRAFFIC_INTERNAL_ONLY` + IAM（Gateway の SA だけが呼べる）。
+- **Runner の起動**: ジョブを実行できるのは Gateway の SA だけ（`roles/run.jobsExecutorWithOverrides`）。
+- **進捗報告**: Runner → Gateway はターン専用トークンで認証し、`iam` モードでは加えて Runner の SA の ID トークンも要る。ターン専用トークンはジョブ実行の環境変数で渡すため、プロジェクトでジョブ実行の詳細を見られる人には見える（有効なのはそのターンの実行中だけ）。
 
 ### 既知の制約
 
@@ -212,23 +259,26 @@ Claude Code の操作を承認する人がいないので、「何をされて�
 - ミラーのパッケージにはマルウェア対策がかからない（公開レジストリの中身をそのまま取る）。被害はサンドボックスと、そのセッションのフォルダの中に限られる。
 - 作ったアプリをユーザーがブラウザで直接触る（プレビュー URL を出す）ことはできない。ターンが終わるとサーバーは止まる。必要なら Runner を GKE Sandbox（gVisor）の「セッションごとに Pod」構成に差し替える。Gateway・API・保存形式はそのまま使える。
 - `costUsd` は SDK の推定値で、請求額ではない。
+- ジョブの起動に毎回数秒〜十数秒かかる（Cloud Run Jobs のコンテナ起動）。短い質問でも、最初の応答まで少し待つ。
 
 ## ディレクトリ構成
 
 ```
 gateway/src/
   server.ts    API ルーティング・認証・SSE
-  store.ts     Firestore（sessions / turns）、ローカル用のメモリ実装
+  store.ts     Firestore（sessions / turns / events）、ローカル用のメモリ実装
   storage.ts   セッションフォルダの読み書き、セッション限定トークンの発行
-  runner.ts    Runner の呼び出し
+  executor.ts  ターンの起動（Cloud Run Jobs / ローカル）
 runner/src/
-  server.ts    POST /v1/turn
+  server.ts    エントリポイント（ジョブとして 1 ターン実行 / ローカルでは簡易サーバー）
+  job.ts       1 ターンの流れ（復元 → 実行 → 保存 → 報告）
+  callback.ts  Gateway への進捗報告
   agent.ts     Claude Code の実行とイベントの変換
   sync.ts      セッションフォルダ ⇔ /sandbox の同期
   storage.ts   GCS（セッション限定トークン）/ ローカルのオブジェクト操作
   packages.ts  npm / PyPI ミラーの設定
   processes.ts ターン終了時の残存プロセスの停止
-infra/terraform/                Cloud Run ×2、VPC・ファイアウォール・DNS、GCS、Firestore、IAM、パッケージミラー
+infra/terraform/                Cloud Run（Gateway）+ Cloud Run Jobs（Runner）、VPC・ファイアウォール・DNS、GCS、Firestore、IAM、パッケージミラー
 integrations/ultra-light-chat/  ultra-light-chat 用アダプタ
 scripts/deploy.sh               ビルドとデプロイ
 docker-compose.yml              ローカル開発用

@@ -67,3 +67,5 @@ if (params.fileId.startsWith('sbx_') && containerId) {
 | テキストのストリーミング | `text_delta` |
 | コード / 実行結果の表示 | `tool_use` / `tool_result` |
 | 出力ファイル | `files_changed`（エージェントが作成・変更したファイル） |
+
+ターンは接続から切り離されているので、途中で上流の接続が切れても（長い作業で 60 分を超えた場合など）、アダプタが `Last-Event-ID` を付けて `/turns/:turnId/events` に自動で再接続し、続きをそのままブラウザに流します。

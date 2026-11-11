@@ -101,6 +101,20 @@ resource "google_firestore_database" "db" {
   depends_on  = [google_project_service.apis]
 }
 
+# countRunning: where status == running and lockedUntil > now
+resource "google_firestore_index" "sessions_running" {
+  database   = google_firestore_database.db.name
+  collection = "sessions"
+  fields {
+    field_path = "status"
+    order      = "ASCENDING"
+  }
+  fields {
+    field_path = "lockedUntil"
+    order      = "ASCENDING"
+  }
+}
+
 # listSessions: where owner == x order by updatedAt desc
 resource "google_firestore_index" "sessions_by_owner" {
   database   = google_firestore_database.db.name
@@ -116,81 +130,92 @@ resource "google_firestore_index" "sessions_by_owner" {
 }
 
 # ------------------------------------------------------------------ runner (sandbox)
+# 1 ターン = Cloud Run Jobs の 1 実行。HTTP 接続に縛られないので、呼び出し元が切断しても
+# 処理は続き、1 ターンの上限も最大 24 時間まで延ばせる。
+# Gateway が実行ごとに SESSION_ID / TURN_ID / TURN_TOKEN / CALLBACK_URL を上書きして起動する。
 
-resource "google_cloud_run_v2_service" "runner" {
-  name     = "agent-sandbox-runner"
-  location = var.region
-  # 外部から直接叩けないようにする（Gateway から VPC 経由 or 内部のみ）
-  ingress             = "INGRESS_TRAFFIC_INTERNAL_ONLY"
+resource "google_cloud_run_v2_job" "runner" {
+  name                = "agent-sandbox-runner"
+  location            = var.region
   deletion_protection = false
 
   template {
-    service_account                  = google_service_account.runner.email
-    timeout                          = "${var.turn_timeout_seconds + 300}s"
-    max_instance_request_concurrency = 1 # 1 コンテナ = 1 ターン
-    execution_environment            = "EXECUTION_ENVIRONMENT_GEN2"
+    task_count = 1
+    template {
+      service_account       = google_service_account.runner.email
+      timeout               = "${var.turn_timeout_seconds + 900}s"
+      max_retries           = 0 # 失敗したターンを勝手にやり直さない
+      execution_environment = "EXECUTION_ENVIRONMENT_GEN2"
 
-    scaling {
-      min_instance_count = var.runner_min_instances
-      max_instance_count = var.runner_max_instances
-    }
-
-    vpc_access {
-      network_interfaces {
-        network    = google_compute_network.sandbox.id
-        subnetwork = google_compute_subnetwork.sandbox.id
-        tags       = ["agent-sandbox-runner"]
-      }
-      egress = "ALL_TRAFFIC" # 全通信を VPC に通し、ファイアウォールで制限する
-    }
-
-    containers {
-      image = var.runner_image
-      resources {
-        limits = {
-          cpu    = var.runner_cpu
-          memory = var.runner_memory
+      vpc_access {
+        network_interfaces {
+          network    = google_compute_network.sandbox.id
+          subnetwork = google_compute_subnetwork.sandbox.id
+          tags       = ["agent-sandbox-runner"]
         }
-        cpu_idle = false
+        egress = "ALL_TRAFFIC" # 全通信を VPC に通し、ファイアウォールで制限する
       }
-      env {
-        name  = "CLAUDE_CODE_USE_VERTEX"
-        value = "1"
-      }
-      env {
-        name  = "CLOUD_ML_REGION"
-        value = var.vertex_region
-      }
-      env {
-        name  = "ANTHROPIC_VERTEX_PROJECT_ID"
-        value = var.project_id
-      }
-      env {
-        name  = "CLAUDE_MODEL"
-        value = var.claude_model
-      }
-      env {
-        name  = "MAX_TURNS"
-        value = tostring(var.max_agent_turns)
-      }
-      env {
-        name  = "NPM_MIRROR_URL"
-        value = local.npm_mirror_url
-      }
-      env {
-        name  = "PYPI_MIRROR_URL"
-        value = local.pypi_mirror_url
+
+      containers {
+        image = var.runner_image
+        resources {
+          limits = {
+            cpu    = var.runner_cpu
+            memory = var.runner_memory
+          }
+        }
+        env {
+          name  = "CLAUDE_CODE_USE_VERTEX"
+          value = "1"
+        }
+        env {
+          name  = "CLOUD_ML_REGION"
+          value = var.vertex_region
+        }
+        env {
+          name  = "ANTHROPIC_VERTEX_PROJECT_ID"
+          value = var.project_id
+        }
+        env {
+          name  = "CLAUDE_MODEL"
+          value = var.claude_model
+        }
+        env {
+          name  = "MAX_TURNS"
+          value = tostring(var.max_agent_turns)
+        }
+        env {
+          name  = "NPM_MIRROR_URL"
+          value = local.npm_mirror_url
+        }
+        env {
+          name  = "PYPI_MIRROR_URL"
+          value = local.pypi_mirror_url
+        }
+        env {
+          # Gateway が IAM 認証のとき、報告に ID トークンを付ける
+          name  = "CALLBACK_USE_ID_TOKEN"
+          value = var.auth_mode == "iam" ? "1" : "0"
+        }
       }
     }
   }
   depends_on = [google_project_service.apis]
 }
 
-resource "google_cloud_run_v2_service_iam_member" "gateway_invokes_runner" {
-  name     = google_cloud_run_v2_service.runner.name
+# Gateway が環境変数を上書きしてジョブを実行できるようにする
+resource "google_cloud_run_v2_job_iam_member" "gateway_runs_runner" {
+  name     = google_cloud_run_v2_job.runner.name
   location = var.region
-  role     = "roles/run.invoker"
+  role     = "roles/run.jobsExecutorWithOverrides"
   member   = "serviceAccount:${google_service_account.gateway.email}"
+}
+
+# ジョブは Runner の SA で動くため、起動する側（Gateway）にその SA を使う権限を与える
+resource "google_service_account_iam_member" "gateway_acts_as_runner" {
+  service_account_id = google_service_account.runner.name
+  role               = "roles/iam.serviceAccountUser"
+  member             = "serviceAccount:${google_service_account.gateway.email}"
 }
 
 # ------------------------------------------------------------------ gateway (API)
@@ -202,26 +227,16 @@ resource "google_cloud_run_v2_service" "gateway" {
   deletion_protection = false
 
   template {
-    service_account                  = google_service_account.gateway.email
-    timeout                          = "${var.turn_timeout_seconds + 120}s"
+    service_account = google_service_account.gateway.email
+    # SSE の 1 接続の上限。長いターンはクライアントが Last-Event-ID で再接続して続きを受け取る
+    timeout                          = "3600s"
     max_instance_request_concurrency = 80
-
-    # Runner は internal ingress なので、Gateway からの呼び出しを VPC 経由にする。
-    # *.run.app / *.googleapis.com は private DNS で private.googleapis.com に向くため
-    # ALL_TRAFFIC にして Private Google Access 経由で到達させる。
-    vpc_access {
-      network_interfaces {
-        network    = google_compute_network.sandbox.id
-        subnetwork = google_compute_subnetwork.gateway.id
-      }
-      egress = "ALL_TRAFFIC"
-    }
 
     containers {
       image = var.gateway_image
       env {
-        name  = "RUNNER_URL"
-        value = google_cloud_run_v2_service.runner.uri
+        name  = "RUNNER_JOB"
+        value = google_cloud_run_v2_job.runner.id
       }
       env {
         name  = "STATE_BUCKET"
@@ -238,6 +253,10 @@ resource "google_cloud_run_v2_service" "gateway" {
       env {
         name  = "TURN_TIMEOUT_MS"
         value = tostring(var.turn_timeout_seconds * 1000)
+      }
+      env {
+        name  = "MAX_RUNNING_TURNS"
+        value = tostring(var.max_running_turns)
       }
       dynamic "env" {
         for_each = var.auth_mode == "token" ? [1] : []
@@ -259,7 +278,8 @@ resource "google_cloud_run_v2_service" "gateway" {
 # iam   : Cloud Run の IAM で認証。invoker_members（チャットボットのバックエンドの SA など）だけが呼べる
 # token : Cloud Run 自体は公開し、アプリ側で Bearer トークンを検証（GCP 外のバックエンドから呼ぶ場合）
 resource "google_cloud_run_v2_service_iam_member" "gateway_invokers" {
-  for_each = var.auth_mode == "iam" ? toset(var.invoker_members) : toset(["allUsers"])
+  # Runner は進捗報告のために Gateway を呼ぶので、iam モードでは Runner の SA も含める
+  for_each = var.auth_mode == "iam" ? toset(concat(var.invoker_members, ["serviceAccount:${google_service_account.runner.email}"])) : toset(["allUsers"])
   name     = google_cloud_run_v2_service.gateway.name
   location = var.region
   role     = "roles/run.invoker"

@@ -24,8 +24,9 @@ services:
     environment:
       AUTH_MODE: none
       STORE: memory
+      EXECUTOR: local            # 本番は Cloud Run Jobs。ローカルは Runner の簡易サーバーに投げる
       RUNNER_URL: http://runner:8080
-      RUNNER_AUTH: none
+      CALLBACK_URL: http://gateway:8080
       LOCAL_STORE_DIR: /store
       ALLOWED_MODELS: claude-opus-5-5,claude-sonnet-5-5,claude-haiku-5-5
     volumes:

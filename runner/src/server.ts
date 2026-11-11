@@ -1,117 +1,50 @@
 /**
- * Sandbox Runner: Claude Code を実行する Cloud Run サービス（内部専用）。
+ * Runner のエントリポイント。
  *
- * POST /v1/turn   1 ターン実行し、イベントを NDJSON でストリーミングする。
- * GET  /healthz
- *
- * 状態は一切持たない。毎ターン:
- *   1. /sandbox を空にする
- *   2. セッションフォルダ (sessions/{id}/) から workspace と会話記録を復元
- *   3. Claude Code を実行
- *   4. 変更分を書き戻し、/sandbox を空にする
- * Cloud Run 側は「concurrency=1」「Gateway の SA だけが invoker」で動かす。
+ * - 本番（Cloud Run Jobs）: 環境変数 TURN_ID などが渡されるので 1 ターン実行して終了する。
+ * - ローカル開発: TURN_ID が無ければ HTTP サーバーとして起動し、POST /v1/jobs で
+ *   ジョブを受け付ける（Cloud Run Jobs の代わり。1 つずつ順番に実行する）。
  */
 import express from "express";
-import { runTurn, type RunnerEvent, type TurnInput } from "./agent.js";
-import { createObjectStore, type StorageSpec } from "./storage.js";
-import { configurePackageMirrors } from "./packages.js";
-import { killStrayProcesses } from "./processes.js";
-import { resetSandbox, restore, save, SANDBOX_ROOT, type SyncResult } from "./sync.js";
-import os from "node:os";
+import { runJob, type JobParams } from "./job.js";
 
-const app = express();
-app.use(express.json({ limit: "1mb" }));
-
-let busy = false;
-
-app.get("/healthz", (_req, res) => {
-  res.json({ ok: true, busy });
-});
-
-interface TurnRequest {
-  sessionId: string;
-  prompt: string;
-  claudeSessionId?: string;
-  storage: StorageSpec;
-  options?: Pick<TurnInput, "model" | "effort" | "systemPrompt">;
-}
-
-type OutEvent =
-  | RunnerEvent
-  | { type: "status"; status: string }
-  | ({ type: "files_changed" } & SyncResult)
-  | { type: "heartbeat" };
-
-app.post("/v1/turn", async (req, res) => {
-  const body = req.body as TurnRequest;
-  if (!body?.sessionId || !/^[A-Za-z0-9_-]+$/.test(body.sessionId) || !body.prompt?.trim() || !body.storage) {
-    res.status(400).json({ error: "sessionId, prompt and storage are required" });
-    return;
-  }
-  if (busy) {
-    res.status(429).json({ error: "runner busy" });
-    return;
-  }
-  busy = true;
-
-  res.status(200);
-  res.setHeader("content-type", "application/x-ndjson; charset=utf-8");
-  res.setHeader("cache-control", "no-cache");
-  res.flushHeaders();
-  const send = (ev: OutEvent) => {
-    if (!res.writableEnded) res.write(JSON.stringify(ev) + "\n");
+if (process.env.TURN_ID) {
+  const params: JobParams = {
+    callbackUrl: process.env.CALLBACK_URL!,
+    sessionId: process.env.SESSION_ID!,
+    turnId: process.env.TURN_ID,
+    turnToken: process.env.TURN_TOKEN!,
   };
+  runJob(params)
+    .then(() => process.exit(0))
+    .catch((e) => {
+      console.error(e);
+      process.exit(1);
+    });
+} else {
+  const app = express();
+  app.use(express.json({ limit: "64kb" }));
+  let queue: Promise<void> = Promise.resolve();
+  let pending = 0;
 
-  const abortController = new AbortController();
-  res.on("close", () => {
-    if (!res.writableFinished) abortController.abort();
+  app.get("/healthz", (_req, res) => {
+    res.json({ ok: true, pending });
   });
-  const heartbeat = setInterval(() => send({ type: "heartbeat" }), 15_000);
 
-  const store = createObjectStore(body.storage);
-  const prefix = `sessions/${body.sessionId}/`;
-  let manifest: Awaited<ReturnType<typeof restore>> | null = null;
-
-  try {
-    await resetSandbox();
-    send({ type: "status", status: "restoring" });
-    manifest = await restore(store, prefix);
-    const extraEnv = await configurePackageMirrors(process.env.HOME ?? os.homedir());
-    send({ type: "status", status: "running" });
-
-    for await (const ev of runTurn({
-      prompt: body.prompt,
-      claudeSessionId: body.claudeSessionId,
-      ...body.options,
-      extraEnv,
-      abortController,
-    })) {
-      send(ev);
+  app.post("/v1/jobs", (req, res) => {
+    const p = req.body as JobParams;
+    if (!p?.callbackUrl || !p.sessionId || !p.turnId || !p.turnToken) {
+      res.status(400).json({ error: "callbackUrl, sessionId, turnId and turnToken are required" });
+      return;
     }
-  } catch (err) {
-    const message = abortController.signal.aborted ? "aborted" : err instanceof Error ? err.message : String(err);
-    console.error("turn failed:", err);
-    send({ type: "error", message });
-  } finally {
-    clearInterval(heartbeat);
-    // エージェントが起動したまま残したプロセス（サーバー等）を止めてから保存する
-    const killed = await killStrayProcesses(SANDBOX_ROOT).catch(() => 0);
-    if (killed) console.log(`killed ${killed} stray process(es)`);
-    // 中断・エラーでも途中までの成果は残す（復元に失敗した場合は書き戻さない）
-    if (manifest) {
-      try {
-        send({ type: "status", status: "saving" });
-        send({ type: "files_changed", ...(await save(store, prefix, manifest)) });
-      } catch (err) {
-        console.error("save failed:", err);
-        send({ type: "error", message: `failed to save workspace: ${(err as Error).message}` });
-      }
-    }
-    await resetSandbox().catch(() => {});
-    busy = false;
-    res.end();
-  }
-});
+    pending++;
+    queue = queue
+      .then(() => runJob(p))
+      .catch((e) => console.error("job failed:", e))
+      .finally(() => pending--);
+    res.status(202).json({ accepted: true, pending });
+  });
 
-const port = Number(process.env.PORT ?? 8081);
-app.listen(port, () => console.log(`runner listening on :${port}`));
+  const port = Number(process.env.PORT ?? 8081);
+  app.listen(port, () => console.log(`runner (local job server) listening on :${port}`));
+}

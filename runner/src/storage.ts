@@ -33,9 +33,14 @@ export type StorageSpec =
   | { type: "gcs"; bucket: string; accessToken: string }
   | { type: "local" };
 
-export function createObjectStore(spec: StorageSpec): ObjectStore {
-  return spec.type === "gcs" ? new GcsStore(spec.bucket, spec.accessToken) : new LocalStore();
+/**
+ * @param refresh  GCS トークンの期限（約 1 時間）が近づいたときに新しい指定を取り直す関数
+ */
+export function createObjectStore(spec: StorageSpec, refresh?: () => Promise<StorageSpec>): ObjectStore {
+  return spec.type === "gcs" ? new GcsStore(spec.bucket, spec.accessToken, refresh) : new LocalStore();
 }
+
+const TOKEN_REFRESH_MS = 45 * 60 * 1000;
 
 export async function md5File(file: string): Promise<string> {
   const h = createHash("md5");
@@ -48,16 +53,29 @@ export async function md5File(file: string): Promise<string> {
 const GCS = "https://storage.googleapis.com";
 
 class GcsStore implements ObjectStore {
+  private issuedAt = Date.now();
   constructor(
     private bucket: string,
     private token: string,
+    private refresh?: () => Promise<StorageSpec>,
   ) {}
+
+  /** ターンが 1 時間を超えることがあるので、期限前にトークンを取り直す */
+  private async ensureToken() {
+    if (!this.refresh || Date.now() - this.issuedAt < TOKEN_REFRESH_MS) return;
+    const spec = await this.refresh();
+    if (spec.type === "gcs") {
+      this.token = spec.accessToken;
+      this.issuedAt = Date.now();
+    }
+  }
 
   private headers(extra: Record<string, string> = {}) {
     return { authorization: `Bearer ${this.token}`, ...extra };
   }
 
   async list(prefix: string): Promise<ObjectInfo[]> {
+    await this.ensureToken();
     const out: ObjectInfo[] = [];
     let pageToken: string | undefined;
     do {
@@ -77,6 +95,7 @@ class GcsStore implements ObjectStore {
   }
 
   async download(name: string, dest: string): Promise<boolean> {
+    await this.ensureToken();
     const u = `${GCS}/storage/v1/b/${encodeURIComponent(this.bucket)}/o/${encodeURIComponent(name)}?alt=media`;
     const res = await fetch(u, { headers: this.headers() });
     if (res.status === 404) return false;
@@ -87,6 +106,7 @@ class GcsStore implements ObjectStore {
   }
 
   async upload(name: string, src: string, contentType = "application/octet-stream"): Promise<void> {
+    await this.ensureToken();
     const u = new URL(`${GCS}/upload/storage/v1/b/${encodeURIComponent(this.bucket)}/o`);
     u.searchParams.set("uploadType", "media");
     u.searchParams.set("name", name);
@@ -102,6 +122,7 @@ class GcsStore implements ObjectStore {
   }
 
   async delete(name: string): Promise<void> {
+    await this.ensureToken();
     const u = `${GCS}/storage/v1/b/${encodeURIComponent(this.bucket)}/o/${encodeURIComponent(name)}`;
     const res = await fetch(u, { method: "DELETE", headers: this.headers() });
     if (!res.ok && res.status !== 404) throw new Error(`gcs delete failed: ${res.status}`);

@@ -2,8 +2,8 @@ output "gateway_url" {
   value = google_cloud_run_v2_service.gateway.uri
 }
 
-output "runner_url" {
-  value = google_cloud_run_v2_service.runner.uri
+output "runner_job" {
+  value = google_cloud_run_v2_job.runner.id
 }
 
 output "state_bucket" {
