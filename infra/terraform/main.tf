@@ -13,8 +13,6 @@ provider "google" {
   region  = var.region
 }
 
-data "google_project" "this" {}
-
 locals {
   services = [
     "run.googleapis.com",
@@ -45,7 +43,7 @@ resource "google_artifact_registry_repository" "repo" {
 
 # ------------------------------------------------------------------ service accounts
 
-# Gateway: Firestore / GCS（状態）/ Runner 呼び出し / 署名付き URL 発行
+# Gateway: Firestore / GCS バケット全体 / Runner 呼び出し / セッション限定トークンの発行
 resource "google_service_account" "gateway" {
   account_id   = "agent-sandbox-gateway"
   display_name = "Agent Sandbox Gateway"
@@ -70,14 +68,11 @@ resource "google_project_iam_member" "gateway_firestore" {
   member  = "serviceAccount:${google_service_account.gateway.email}"
 }
 
-# 署名付き URL を IAM signBlob で発行するため、Gateway SA が自分自身のトークン作成者になる
-resource "google_service_account_iam_member" "gateway_self_sign" {
-  service_account_id = google_service_account.gateway.name
-  role               = "roles/iam.serviceAccountTokenCreator"
-  member             = "serviceAccount:${google_service_account.gateway.email}"
-}
-
-# ------------------------------------------------------------------ state storage
+# ------------------------------------------------------------------ session storage
+# バケットは 1 つだけ。sessions/{sessionId}/ のフォルダでセッションを論理的に分ける。
+#   sessions/{id}/workspace/**         ユーザーのファイル + エージェントの成果物
+#   sessions/{id}/.state/claude.tar.gz Claude Code の会話記録
+# Runner には sessions/{id}/ だけに絞ったダウンスコープトークン（Credential Access Boundary）を渡す。
 
 resource "google_storage_bucket" "state" {
   name                        = "${var.project_id}-agent-sandbox-state"
@@ -190,15 +185,13 @@ resource "google_cloud_run_v2_service_iam_member" "gateway_invokes_runner" {
   member   = "serviceAccount:${google_service_account.gateway.email}"
 }
 
-# ------------------------------------------------------------------ gateway (public API + chat UI)
+# ------------------------------------------------------------------ gateway (API)
 
 resource "google_cloud_run_v2_service" "gateway" {
   name                = "agent-sandbox-gateway"
   location            = var.region
   ingress             = "INGRESS_TRAFFIC_ALL"
   deletion_protection = false
-  iap_enabled         = var.auth_mode == "iap"
-  launch_stage        = var.auth_mode == "iap" ? "BETA" : null
 
   template {
     service_account                  = google_service_account.gateway.email
@@ -231,6 +224,10 @@ resource "google_cloud_run_v2_service" "gateway" {
         value = var.auth_mode
       }
       env {
+        name  = "ALLOWED_MODELS"
+        value = join(",", var.allowed_models)
+      }
+      env {
         name  = "TURN_TIMEOUT_MS"
         value = tostring(var.turn_timeout_seconds * 1000)
       }
@@ -251,14 +248,14 @@ resource "google_cloud_run_v2_service" "gateway" {
   depends_on = [google_project_service.apis]
 }
 
-# token / none モードでは Cloud Run 自体は公開し、アプリ側で認証する。
-# iap モードでは IAP が認証するので allUsers は付けない。
-resource "google_cloud_run_v2_service_iam_member" "gateway_public" {
-  count    = var.auth_mode == "iap" ? 0 : 1
+# iam   : Cloud Run の IAM で認証。invoker_members（チャットボットのバックエンドの SA など）だけが呼べる
+# token : Cloud Run 自体は公開し、アプリ側で Bearer トークンを検証（GCP 外のバックエンドから呼ぶ場合）
+resource "google_cloud_run_v2_service_iam_member" "gateway_invokers" {
+  for_each = var.auth_mode == "iam" ? toset(var.invoker_members) : toset(["allUsers"])
   name     = google_cloud_run_v2_service.gateway.name
   location = var.region
   role     = "roles/run.invoker"
-  member   = "allUsers"
+  member   = each.value
 }
 
 resource "google_secret_manager_secret_iam_member" "gateway_token" {
@@ -266,22 +263,4 @@ resource "google_secret_manager_secret_iam_member" "gateway_token" {
   secret_id = var.api_token_secret
   role      = "roles/secretmanager.secretAccessor"
   member    = "serviceAccount:${google_service_account.gateway.email}"
-}
-
-# IAP モード: 利用を許可するユーザー/グループ
-resource "google_iap_web_cloud_run_service_iam_member" "users" {
-  for_each               = var.auth_mode == "iap" ? toset(var.iap_members) : toset([])
-  location               = var.region
-  cloud_run_service_name = google_cloud_run_v2_service.gateway.name
-  role                   = "roles/iap.httpsResourceAccessor"
-  member                 = each.value
-}
-
-# IAP サービスエージェントが Gateway を invoke できるようにする
-resource "google_cloud_run_v2_service_iam_member" "iap_invoker" {
-  count    = var.auth_mode == "iap" ? 1 : 0
-  name     = google_cloud_run_v2_service.gateway.name
-  location = var.region
-  role     = "roles/run.invoker"
-  member   = "serviceAccount:service-${data.google_project.this.number}@gcp-sa-iap.iam.gserviceaccount.com"
 }

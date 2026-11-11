@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
-# 使い方: PROJECT_ID=my-proj [REGION=asia-northeast1] [AUTH_MODE=token] ./scripts/deploy.sh
+# 使い方:
+#   PROJECT_ID=my-proj AUTH_MODE=iam INVOKER=serviceAccount:chat-backend@my-proj.iam.gserviceaccount.com ./scripts/deploy.sh
+#   PROJECT_ID=my-proj AUTH_MODE=token ./scripts/deploy.sh
 set -euo pipefail
 
 : "${PROJECT_ID:?PROJECT_ID を指定してください}"
 REGION="${REGION:-asia-northeast1}"
-AUTH_MODE="${AUTH_MODE:-token}"
+AUTH_MODE="${AUTH_MODE:-iam}"
+INVOKER="${INVOKER:-}"
 TAG="${TAG:-$(git rev-parse --short HEAD 2>/dev/null || date +%s)}"
 REPO="${REGION}-docker.pkg.dev/${PROJECT_ID}/agent-sandbox"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -18,12 +21,13 @@ if [[ "$AUTH_MODE" == "token" ]]; then
   if ! gcloud secrets describe agent-sandbox-api-token >/dev/null 2>&1; then
     TOKEN="$(openssl rand -hex 32)"
     printf '%s' "$TOKEN" | gcloud secrets create agent-sandbox-api-token --data-file=-
-    echo ">>> API トークンを作成しました（チャット UI の「API トークン設定」に入力）: $TOKEN"
+    echo ">>> API トークンを作成しました（チャットボットのバックエンドに設定）: $TOKEN"
   fi
 fi
 
 VARS=(-var "project_id=${PROJECT_ID}" -var "region=${REGION}" -var "auth_mode=${AUTH_MODE}"
       -var "runner_image=${REPO}/runner:${TAG}" -var "gateway_image=${REPO}/gateway:${TAG}")
+if [[ -n "$INVOKER" ]]; then VARS+=(-var "invoker_members=[\"${INVOKER}\"]"); fi
 
 terraform -chdir="$TF" init -input=false
 

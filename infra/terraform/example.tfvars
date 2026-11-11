@@ -3,10 +3,10 @@ region        = "asia-northeast1"
 runner_image  = "asia-northeast1-docker.pkg.dev/your-gcp-project/agent-sandbox/runner:latest"
 gateway_image = "asia-northeast1-docker.pkg.dev/your-gcp-project/agent-sandbox/gateway:latest"
 
-# token: Authorization: Bearer <token> で認証（Secret Manager に事前登録）
-# iap  : Google アカウントでログイン（iap_members に許可ユーザーを列挙）
-auth_mode = "token"
-# auth_mode   = "iap"
-# iap_members = ["user:you@example.com"]
+# iam  : GCP 上のチャットボットのバックエンドから呼ぶ（推奨）
+# token: GCP 外（Azure 等）から Authorization: Bearer <token> で呼ぶ
+auth_mode       = "iam"
+invoker_members = ["serviceAccount:chat-backend@your-gcp-project.iam.gserviceaccount.com"]
+# auth_mode = "token"
 
 runner_internet_access = false

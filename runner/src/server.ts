@@ -1,15 +1,20 @@
 /**
- * Sandbox Runner: Claude Code を実行する Cloud Run サービス。
+ * Sandbox Runner: Claude Code を実行する Cloud Run サービス（内部専用）。
  *
  * POST /v1/turn   1 ターン実行し、イベントを NDJSON でストリーミングする。
  * GET  /healthz
  *
- * Cloud Run 側で「認証必須 + Gateway の SA のみ invoker」「concurrency=1」で動かす前提。
- * concurrency=1 なので /sandbox は常に 1 セッションだけが使う。
+ * 状態は一切持たない。毎ターン:
+ *   1. /sandbox を空にする
+ *   2. セッションフォルダ (sessions/{id}/) から workspace と会話記録を復元
+ *   3. Claude Code を実行
+ *   4. 変更分を書き戻し、/sandbox を空にする
+ * Cloud Run 側は「concurrency=1」「Gateway の SA だけが invoker」で動かす。
  */
 import express from "express";
-import { runTurn, type RunnerEvent } from "./agent.js";
-import { resetSandbox, restoreState, saveState } from "./state.js";
+import { runTurn, type RunnerEvent, type TurnInput } from "./agent.js";
+import { createObjectStore, type StorageSpec } from "./storage.js";
+import { resetSandbox, restore, save, type SyncResult } from "./sync.js";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -24,17 +29,23 @@ interface TurnRequest {
   sessionId: string;
   prompt: string;
   claudeSessionId?: string;
-  state?: { downloadUrl?: string; uploadUrl?: string };
+  storage: StorageSpec;
+  options?: Pick<TurnInput, "model" | "effort" | "systemPrompt">;
 }
+
+type OutEvent =
+  | RunnerEvent
+  | { type: "status"; status: string }
+  | ({ type: "files_changed" } & SyncResult)
+  | { type: "heartbeat" };
 
 app.post("/v1/turn", async (req, res) => {
   const body = req.body as TurnRequest;
-  if (!body?.sessionId || typeof body.prompt !== "string" || !body.prompt.trim()) {
-    res.status(400).json({ error: "sessionId and prompt are required" });
+  if (!body?.sessionId || !/^[A-Za-z0-9_-]+$/.test(body.sessionId) || !body.prompt?.trim() || !body.storage) {
+    res.status(400).json({ error: "sessionId, prompt and storage are required" });
     return;
   }
   if (busy) {
-    // concurrency=1 なら通常起きない。起きたら Gateway にリトライさせる。
     res.status(429).json({ error: "runner busy" });
     return;
   }
@@ -44,8 +55,7 @@ app.post("/v1/turn", async (req, res) => {
   res.setHeader("content-type", "application/x-ndjson; charset=utf-8");
   res.setHeader("cache-control", "no-cache");
   res.flushHeaders();
-
-  const send = (ev: RunnerEvent | { type: "state_saved" } | { type: "heartbeat" }) => {
+  const send = (ev: OutEvent) => {
     if (!res.writableEnded) res.write(JSON.stringify(ev) + "\n");
   };
 
@@ -53,41 +63,40 @@ app.post("/v1/turn", async (req, res) => {
   res.on("close", () => {
     if (!res.writableFinished) abortController.abort();
   });
-  // 長いツール実行中もプロキシに切られないよう定期的に送る
   const heartbeat = setInterval(() => send({ type: "heartbeat" }), 15_000);
 
-  const loc = { sessionId: body.sessionId, ...body.state };
-  let restored = false;
+  const store = createObjectStore(body.storage);
+  const prefix = `sessions/${body.sessionId}/`;
+  let manifest: Awaited<ReturnType<typeof restore>> | null = null;
+
   try {
     await resetSandbox();
-    await restoreState(loc);
-    restored = true;
+    send({ type: "status", status: "restoring" });
+    manifest = await restore(store, prefix);
+    send({ type: "status", status: "running" });
 
     for await (const ev of runTurn({
       prompt: body.prompt,
       claudeSessionId: body.claudeSessionId,
+      ...body.options,
       abortController,
     })) {
       send(ev);
     }
   } catch (err) {
-    const message = abortController.signal.aborted
-      ? "aborted"
-      : err instanceof Error
-        ? err.message
-        : String(err);
+    const message = abortController.signal.aborted ? "aborted" : err instanceof Error ? err.message : String(err);
     console.error("turn failed:", err);
     send({ type: "error", message });
   } finally {
     clearInterval(heartbeat);
-    // 中断・エラーでも途中までの作業は残す（復元に失敗した場合は上書きしない）
-    if (restored) {
+    // 中断・エラーでも途中までの成果は残す（復元に失敗した場合は書き戻さない）
+    if (manifest) {
       try {
-        await saveState(loc);
-        send({ type: "state_saved" });
+        send({ type: "status", status: "saving" });
+        send({ type: "files_changed", ...(await save(store, prefix, manifest)) });
       } catch (err) {
         console.error("save failed:", err);
-        send({ type: "error", message: `failed to save state: ${(err as Error).message}` });
+        send({ type: "error", message: `failed to save workspace: ${(err as Error).message}` });
       }
     }
     await resetSandbox().catch(() => {});

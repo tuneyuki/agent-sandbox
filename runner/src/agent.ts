@@ -3,11 +3,14 @@
  * フロントに流しやすい単純なイベントに変換して返す。
  */
 import { query, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
-import { CLAUDE_DIR, WORKSPACE_DIR } from "./state.js";
+import { CLAUDE_DIR, WORKSPACE_DIR } from "./sync.js";
 
 /** Runner → Gateway に流すイベント（NDJSON の 1 行 = 1 イベント）。 */
 export type RunnerEvent =
   | { type: "session"; claudeSessionId: string; model?: string }
+  /** 文字単位のストリーミング（チャット表示用） */
+  | { type: "text_delta"; delta: string }
+  /** 確定したテキストブロック（履歴保存用） */
   | { type: "text"; text: string }
   | { type: "tool_use"; id: string; name: string; input: unknown }
   | { type: "tool_result"; toolUseId: string; isError: boolean; content: string }
@@ -26,6 +29,10 @@ export interface TurnInput {
   prompt: string;
   /** 前ターンの Claude Code セッション ID。あれば resume する。 */
   claudeSessionId?: string;
+  /** リクエストごとの上書き（Gateway 側で検証済みのもの） */
+  model?: string;
+  effort?: "low" | "medium" | "high" | "xhigh" | "max";
+  systemPrompt?: string;
   abortController: AbortController;
 }
 
@@ -80,7 +87,9 @@ function agentEnv(): Record<string, string> {
 const SYSTEM_APPEND = `
 あなたはチャットボット経由でユーザーと対話しているサンドボックス内のエージェントです。
 - 作業ディレクトリは ${WORKSPACE_DIR} です。ファイルはここに作成してください。
-- ユーザーは端末を見ていません。最終回答には、何をしたか・結果・作成したファイルを簡潔にまとめてください。
+- ユーザーが渡したファイルは ${WORKSPACE_DIR}/uploads/ に置かれます。
+- ユーザーは端末を見ていません。成果物はファイルとして作業ディレクトリに保存してください（ユーザーはそれをダウンロードできます）。
+- 最終回答には、何をしたか・結果・作成/変更したファイルのパスを簡潔にまとめてください。
 `.trim();
 
 function toolResultText(content: unknown): string {
@@ -102,6 +111,14 @@ function* convert(msg: SDKMessage): Generator<RunnerEvent> {
         yield { type: "session", claudeSessionId: msg.session_id, model: msg.model };
       }
       return;
+    case "stream_event": {
+      if (msg.parent_tool_use_id) return;
+      const ev = msg.event;
+      if (ev.type === "content_block_delta" && ev.delta.type === "text_delta" && ev.delta.text) {
+        yield { type: "text_delta", delta: ev.delta.text };
+      }
+      return;
+    }
     case "assistant":
       // サブエージェント内部のメッセージはチャットには出さない
       if (msg.parent_tool_use_id) return;
@@ -151,8 +168,9 @@ export async function* runTurn(input: TurnInput): AsyncGenerator<RunnerEvent> {
     options: {
       cwd: WORKSPACE_DIR,
       resume: input.claudeSessionId,
-      model: process.env.CLAUDE_MODEL || undefined,
-      effort: (process.env.CLAUDE_EFFORT as any) || undefined,
+      model: input.model || process.env.CLAUDE_MODEL || undefined,
+      effort: input.effort || (process.env.CLAUDE_EFFORT as any) || undefined,
+      includePartialMessages: true,
       // 誰も承認ボタンを押せないので、許可リスト外のツールは自動拒否する。
       // サンドボックス自体（Cloud Run + VPC egress 制限 + 権限なし SA）で守る前提。
       permissionMode: "dontAsk",
@@ -161,7 +179,11 @@ export async function* runTurn(input: TurnInput): AsyncGenerator<RunnerEvent> {
       maxTurns: Number(process.env.MAX_TURNS ?? 50),
       // ユーザー/プロジェクトの settings.json は読まない（再現性のため）
       settingSources: [],
-      systemPrompt: { type: "preset", preset: "claude_code", append: SYSTEM_APPEND },
+      systemPrompt: {
+        type: "preset",
+        preset: "claude_code",
+        append: input.systemPrompt ? `${SYSTEM_APPEND}\n\n${input.systemPrompt}` : SYSTEM_APPEND,
+      },
       env: agentEnv(),
       abortController: input.abortController,
     },

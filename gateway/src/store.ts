@@ -1,29 +1,49 @@
 /**
- * セッションとチャット履歴の保存先。
+ * セッションとターンのメタデータ（Firestore）。ファイルの実体は GCS 側。
+ *
+ *   sessions/{sessionId}
+ *     owner, title, claudeSessionId, status, lockedUntil, turnCount, totalCostUsd, createdAt, updatedAt
+ *   sessions/{sessionId}/turns/{turnId}
+ *     input, attachments[], status, text, events[], filesChanged, costUsd, error, startedAt, finishedAt
+ *
  * 本番は Firestore、ローカル開発はメモリ（STORE=memory）。
  */
-import { Firestore, FieldValue, Timestamp } from "@google-cloud/firestore";
+import { Firestore, FieldValue } from "@google-cloud/firestore";
 import { randomUUID } from "node:crypto";
+
+export type SessionStatus = "idle" | "running";
 
 export interface Session {
   id: string;
   owner: string;
   title: string;
   claudeSessionId?: string;
+  status: SessionStatus;
+  /** 実行中ロックの期限 (epoch ms)。Gateway が落ちてもこの時刻を過ぎれば解放扱い */
+  lockedUntil: number;
+  turnCount: number;
+  /** SDK が返す累計コストの推定値 */
+  totalCostUsd: number;
   createdAt: number;
   updatedAt: number;
-  /** 実行中ロックの期限 (epoch ms)。0 なら空き。 */
-  lockedUntil: number;
-  totalCostUsd: number;
 }
 
-export interface ChatMessage {
+export type TurnStatus = "running" | "completed" | "failed" | "aborted";
+
+export interface Turn {
   id: string;
-  role: "user" | "assistant";
-  /** assistant の場合はイベント列（text / tool_use / tool_result / result / error）も保存 */
+  input: string;
+  attachments: string[];
+  status: TurnStatus;
+  /** アシスタントの最終テキスト */
   text: string;
-  events?: unknown[];
-  createdAt: number;
+  /** 表示用イベント列（text_delta は除外、tool_result は切り詰め） */
+  events: unknown[];
+  filesChanged?: { added: unknown[]; modified: unknown[]; deleted: unknown[] };
+  costUsd?: number;
+  error?: string;
+  startedAt: number;
+  finishedAt?: number;
 }
 
 export interface Store {
@@ -31,36 +51,47 @@ export interface Store {
   getSession(id: string): Promise<Session | null>;
   listSessions(owner: string): Promise<Session[]>;
   deleteSession(id: string): Promise<void>;
-  /** ロックを取得できたら true。同一セッションでの同時実行を防ぐ。 */
+  /** ロック取得に成功したら true（同一セッションの同時実行・実行中のファイル変更を防ぐ） */
   tryLock(id: string, ttlMs: number): Promise<boolean>;
-  unlock(id: string, patch: { claudeSessionId?: string; addCostUsd?: number }): Promise<void>;
-  addMessage(sessionId: string, msg: Omit<ChatMessage, "id" | "createdAt">): Promise<ChatMessage>;
-  listMessages(sessionId: string): Promise<ChatMessage[]>;
+  unlock(id: string, patch: { claudeSessionId?: string; totalCostUsd?: number; incrementTurn?: boolean }): Promise<void>;
+  isLocked(s: Session): boolean;
+  startTurn(sessionId: string, input: string, attachments: string[]): Promise<Turn>;
+  finishTurn(sessionId: string, turnId: string, patch: Partial<Turn>): Promise<void>;
+  listTurns(sessionId: string): Promise<Turn[]>;
 }
 
-export function newSessionId(): string {
+function newId(): string {
   return randomUUID().replace(/-/g, "");
 }
+
+function newSession(owner: string, title: string): Session {
+  const now = Date.now();
+  return {
+    id: newId(),
+    owner,
+    title,
+    status: "idle",
+    lockedUntil: 0,
+    turnCount: 0,
+    totalCostUsd: 0,
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+const isLocked = (s: Session) => s.status === "running" && s.lockedUntil > Date.now();
 
 // ---------------------------------------------------------------- memory
 
 export class MemoryStore implements Store {
   private sessions = new Map<string, Session>();
-  private messages = new Map<string, ChatMessage[]>();
+  private turns = new Map<string, Turn[]>();
+  isLocked = isLocked;
 
   async createSession(owner: string, title: string) {
-    const now = Date.now();
-    const s: Session = {
-      id: newSessionId(),
-      owner,
-      title,
-      createdAt: now,
-      updatedAt: now,
-      lockedUntil: 0,
-      totalCostUsd: 0,
-    };
+    const s = newSession(owner, title);
     this.sessions.set(s.id, s);
-    this.messages.set(s.id, []);
+    this.turns.set(s.id, []);
     return { ...s };
   }
   async getSession(id: string) {
@@ -68,37 +99,40 @@ export class MemoryStore implements Store {
     return s ? { ...s } : null;
   }
   async listSessions(owner: string) {
-    return [...this.sessions.values()]
-      .filter((s) => s.owner === owner)
-      .sort((a, b) => b.updatedAt - a.updatedAt);
+    return [...this.sessions.values()].filter((s) => s.owner === owner).sort((a, b) => b.updatedAt - a.updatedAt);
   }
   async deleteSession(id: string) {
     this.sessions.delete(id);
-    this.messages.delete(id);
+    this.turns.delete(id);
   }
   async tryLock(id: string, ttlMs: number) {
     const s = this.sessions.get(id);
-    if (!s) return false;
-    const now = Date.now();
-    if (s.lockedUntil > now) return false;
-    s.lockedUntil = now + ttlMs;
+    if (!s || isLocked(s)) return false;
+    s.status = "running";
+    s.lockedUntil = Date.now() + ttlMs;
     return true;
   }
-  async unlock(id: string, patch: { claudeSessionId?: string; addCostUsd?: number }) {
+  async unlock(id: string, patch: { claudeSessionId?: string; totalCostUsd?: number; incrementTurn?: boolean }) {
     const s = this.sessions.get(id);
     if (!s) return;
+    s.status = "idle";
     s.lockedUntil = 0;
     s.updatedAt = Date.now();
     if (patch.claudeSessionId) s.claudeSessionId = patch.claudeSessionId;
-    if (patch.addCostUsd) s.totalCostUsd += patch.addCostUsd;
+    if (patch.totalCostUsd !== undefined) s.totalCostUsd = patch.totalCostUsd;
+    if (patch.incrementTurn) s.turnCount++;
   }
-  async addMessage(sessionId: string, msg: Omit<ChatMessage, "id" | "createdAt">) {
-    const m: ChatMessage = { ...msg, id: randomUUID(), createdAt: Date.now() };
-    this.messages.get(sessionId)?.push(m);
-    return m;
+  async startTurn(sessionId: string, input: string, attachments: string[]) {
+    const t: Turn = { id: newId(), input, attachments, status: "running", text: "", events: [], startedAt: Date.now() };
+    this.turns.get(sessionId)?.push(t);
+    return { ...t };
   }
-  async listMessages(sessionId: string) {
-    return [...(this.messages.get(sessionId) ?? [])];
+  async finishTurn(sessionId: string, turnId: string, patch: Partial<Turn>) {
+    const t = this.turns.get(sessionId)?.find((x) => x.id === turnId);
+    if (t) Object.assign(t, patch);
+  }
+  async listTurns(sessionId: string) {
+    return [...(this.turns.get(sessionId) ?? [])];
   }
 }
 
@@ -106,6 +140,7 @@ export class MemoryStore implements Store {
 
 export class FirestoreStore implements Store {
   private db: Firestore;
+  isLocked = isLocked;
   constructor(databaseId?: string) {
     this.db = new Firestore({ databaseId, ignoreUndefinedProperties: true });
   }
@@ -114,16 +149,7 @@ export class FirestoreStore implements Store {
   }
 
   async createSession(owner: string, title: string) {
-    const now = Date.now();
-    const s: Session = {
-      id: newSessionId(),
-      owner,
-      title,
-      createdAt: now,
-      updatedAt: now,
-      lockedUntil: 0,
-      totalCostUsd: 0,
-    };
+    const s = newSession(owner, title);
     await this.col().doc(s.id).set(s);
     return s;
   }
@@ -142,36 +168,35 @@ export class FirestoreStore implements Store {
     const ref = this.col().doc(id);
     return this.db.runTransaction(async (tx) => {
       const snap = await tx.get(ref);
-      if (!snap.exists) return false;
-      const s = snap.data() as Session;
-      const now = Date.now();
-      if (s.lockedUntil > now) return false;
-      tx.update(ref, { lockedUntil: now + ttlMs });
+      if (!snap.exists || isLocked(snap.data() as Session)) return false;
+      tx.update(ref, { status: "running", lockedUntil: Date.now() + ttlMs });
       return true;
     });
   }
-  async unlock(id: string, patch: { claudeSessionId?: string; addCostUsd?: number }) {
+  async unlock(id: string, patch: { claudeSessionId?: string; totalCostUsd?: number; incrementTurn?: boolean }) {
     await this.col()
       .doc(id)
       .update({
+        status: "idle",
         lockedUntil: 0,
         updatedAt: Date.now(),
         claudeSessionId: patch.claudeSessionId,
-        totalCostUsd: FieldValue.increment(patch.addCostUsd ?? 0),
+        totalCostUsd: patch.totalCostUsd,
+        turnCount: patch.incrementTurn ? FieldValue.increment(1) : undefined,
       });
   }
-  async addMessage(sessionId: string, msg: Omit<ChatMessage, "id" | "createdAt">) {
-    const ref = this.col().doc(sessionId).collection("messages").doc();
-    const m: ChatMessage = { ...msg, id: ref.id, createdAt: Date.now() };
-    await ref.set({ ...m, ts: Timestamp.now() });
-    return m;
+  async startTurn(sessionId: string, input: string, attachments: string[]) {
+    const ref = this.col().doc(sessionId).collection("turns").doc();
+    const t: Turn = { id: ref.id, input, attachments, status: "running", text: "", events: [], startedAt: Date.now() };
+    await ref.set(t);
+    return t;
   }
-  async listMessages(sessionId: string) {
-    const q = await this.col().doc(sessionId).collection("messages").orderBy("createdAt").get();
-    return q.docs.map((d) => {
-      const { ts: _ts, ...rest } = d.data();
-      return rest as ChatMessage;
-    });
+  async finishTurn(sessionId: string, turnId: string, patch: Partial<Turn>) {
+    await this.col().doc(sessionId).collection("turns").doc(turnId).update(patch);
+  }
+  async listTurns(sessionId: string) {
+    const q = await this.col().doc(sessionId).collection("turns").orderBy("startedAt").get();
+    return q.docs.map((d) => d.data() as Turn);
   }
 }
 

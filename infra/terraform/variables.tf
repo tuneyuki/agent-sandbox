@@ -72,29 +72,35 @@ variable "runner_internet_access" {
 }
 
 variable "state_retention_days" {
-  description = "セッションの作業ディレクトリを GCS に保持する日数"
+  description = "セッションフォルダ（ファイル）を GCS に保持する日数"
   type        = number
   default     = 30
 }
 
+variable "allowed_models" {
+  description = "リクエストで指定を許可するモデル（未指定なら claude_model を使う）"
+  type        = list(string)
+  default     = ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]
+}
+
 variable "auth_mode" {
-  description = "iap | token"
+  description = "iam（Cloud Run IAM、GCP 内のバックエンドから呼ぶ場合に推奨） | token（Bearer トークン）"
   type        = string
-  default     = "token"
+  default     = "iam"
   validation {
-    condition     = contains(["iap", "token"], var.auth_mode)
-    error_message = "auth_mode must be iap or token"
+    condition     = contains(["iam", "token"], var.auth_mode)
+    error_message = "auth_mode must be iam or token"
   }
+}
+
+variable "invoker_members" {
+  description = "auth_mode=iam のとき Gateway を呼べるメンバー（例: serviceAccount:chat-backend@PROJECT.iam.gserviceaccount.com）"
+  type        = list(string)
+  default     = []
 }
 
 variable "api_token_secret" {
   description = "auth_mode=token のとき、API トークンを格納した Secret Manager のシークレット名"
   type        = string
   default     = "agent-sandbox-api-token"
-}
-
-variable "iap_members" {
-  description = "auth_mode=iap のとき利用を許可するメンバー（例: user:alice@example.com, group:team@example.com）"
-  type        = list(string)
-  default     = []
 }

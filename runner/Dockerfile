@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates git tar gzip curl jq ripgrep python3 python3-pip python3-venv \
     && rm -rf /var/lib/apt/lists/*
 # 非 root ユーザーで実行
-RUN useradd --create-home --uid 10001 agent && mkdir -p /sandbox /state && chown agent:agent /sandbox /state
+RUN useradd --create-home --uid 10001 agent && mkdir -p /sandbox /store && chown agent:agent /sandbox /store
 WORKDIR /app
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist

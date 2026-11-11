@@ -10,7 +10,6 @@ FROM node:22-bookworm-slim
 WORKDIR /app
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
-COPY public ./public
 COPY package.json ./
 USER node
 ENV NODE_ENV=production PORT=8080
