@@ -360,7 +360,7 @@ v1.post(
           case "files_changed": {
             const url = (p: string) => `/v1/sessions/${s.id}/files/${p.split("/").map(encodeURIComponent).join("/")}`;
             const withUrl = (xs: any[]) => xs.map((x) => ({ ...x, url: url(x.path) }));
-            filesChanged = { added: withUrl(ev.added), modified: withUrl(ev.modified), deleted: ev.deleted };
+            filesChanged = { added: withUrl(ev.added), modified: withUrl(ev.modified), deleted: ev.deleted, deps: ev.deps };
             sse({ type: "files_changed", ...filesChanged });
             continue;
           }

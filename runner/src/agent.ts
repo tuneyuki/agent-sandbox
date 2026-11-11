@@ -4,6 +4,7 @@
  */
 import { query, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { CLAUDE_DIR, WORKSPACE_DIR } from "./sync.js";
+import { TURN_MARKER } from "./processes.js";
 
 /** Runner → Gateway に流すイベント（NDJSON の 1 行 = 1 イベント）。 */
 export type RunnerEvent =
@@ -33,6 +34,8 @@ export interface TurnInput {
   model?: string;
   effort?: "low" | "medium" | "high" | "xhigh" | "max";
   systemPrompt?: string;
+  /** パッケージミラー設定など、ターンごとに決まる環境変数 */
+  extraEnv?: Record<string, string>;
   abortController: AbortController;
 }
 
@@ -54,7 +57,7 @@ function csv(name: string, fallback: string[]): string[] {
 }
 
 /** エージェントに渡す環境変数。Runner 自身の環境変数は必要なものだけに絞る。 */
-function agentEnv(): Record<string, string> {
+function agentEnv(extra: Record<string, string> = {}): Record<string, string> {
   const pass = [
     "PATH",
     "HOME",
@@ -69,7 +72,14 @@ function agentEnv(): Record<string, string> {
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_MODEL",
     "HTTPS_PROXY",
+    "HTTP_PROXY",
     "NO_PROXY",
+    // 社内プロキシ等で独自 CA が必要な場合
+    "NODE_EXTRA_CA_CERTS",
+    "SSL_CERT_FILE",
+    "REQUESTS_CA_BUNDLE",
+    "PIP_CERT",
+    "UV_NATIVE_TLS",
   ];
   const env: Record<string, string> = {};
   for (const k of pass) {
@@ -81,7 +91,19 @@ function agentEnv(): Record<string, string> {
   env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
   // 1 ターンごとにサンドボックスを破棄するので、ターンをまたぐバックグラウンド実行は使わせない
   env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS = "1";
-  return env;
+  // ビルドやテストは長くかかるので Bash のタイムアウトを延ばす（既定 10 分、最大 30 分）
+  env.BASH_DEFAULT_TIMEOUT_MS = process.env.BASH_DEFAULT_TIMEOUT_MS ?? String(10 * 60 * 1000);
+  env.BASH_MAX_TIMEOUT_MS = process.env.BASH_MAX_TIMEOUT_MS ?? String(30 * 60 * 1000);
+  env.BASH_MAX_OUTPUT_LENGTH = process.env.BASH_MAX_OUTPUT_LENGTH ?? "60000";
+  // ターン終了時に残ったプロセスを見つけるための印
+  env[TURN_MARKER] = "1";
+  // パッケージのキャッシュはコンテナ内の一時領域に（セッションには保存しない）
+  env.npm_config_cache = "/tmp/npm-cache";
+  env.PIP_CACHE_DIR = "/tmp/pip-cache";
+  env.UV_CACHE_DIR = "/tmp/uv-cache";
+  env.UV_LINK_MODE = "copy";
+  env.PYTHONDONTWRITEBYTECODE = "1";
+  return { ...env, ...extra };
 }
 
 const SYSTEM_APPEND = `
@@ -90,6 +112,15 @@ const SYSTEM_APPEND = `
 - ユーザーが渡したファイルは ${WORKSPACE_DIR}/uploads/ に置かれます。
 - ユーザーは端末を見ていません。成果物はファイルとして作業ディレクトリに保存してください（ユーザーはそれをダウンロードできます）。
 - 最終回答には、何をしたか・結果・作成/変更したファイルのパスを簡潔にまとめてください。
+
+## 開発環境
+- Python 3（python3）、Node.js 22（node / npm / npx）、pnpm、uv、git、gcc / make が使えます。
+- パッケージは npm / pnpm / pip / uv で通常どおりインストールできます（社内ミラー経由。任意の Web サイトには接続できない場合があります）。
+- Python の依存は必ずプロジェクト内の仮想環境に入れてください（例: \`uv venv .venv && uv pip install -r requirements.txt\`、または \`python3 -m venv .venv\`）。システムの Python には入れられません。
+- node_modules/ と .venv/ は次のターンにも引き継がれます。依存を足したら package.json / requirements.txt / pyproject.toml も更新してください。
+- アプリを作ったら、ビルド・テスト・実行まで行って動作を確かめてください。
+- Web サーバーなどの常駐プロセスは、ログをファイルに出してバックグラウンドで起動し（例: \`nohup python app.py > server.log 2>&1 &\`）、curl で確認してください。ポート 8080 は使用中なので 3000 などを使ってください。
+- ターンが終わると起動中のプロセスはすべて停止します。ユーザーから見えるのは作業ディレクトリのファイルと、あなたの回答だけです。実行結果は回答に含めてください。
 `.trim();
 
 function toolResultText(content: unknown): string {
@@ -184,7 +215,7 @@ export async function* runTurn(input: TurnInput): AsyncGenerator<RunnerEvent> {
         preset: "claude_code",
         append: input.systemPrompt ? `${SYSTEM_APPEND}\n\n${input.systemPrompt}` : SYSTEM_APPEND,
       },
-      env: agentEnv(),
+      env: agentEnv(input.extraEnv),
       abortController: input.abortController,
     },
   });

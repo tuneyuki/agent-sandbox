@@ -14,7 +14,10 @@
 import express from "express";
 import { runTurn, type RunnerEvent, type TurnInput } from "./agent.js";
 import { createObjectStore, type StorageSpec } from "./storage.js";
-import { resetSandbox, restore, save, type SyncResult } from "./sync.js";
+import { configurePackageMirrors } from "./packages.js";
+import { killStrayProcesses } from "./processes.js";
+import { resetSandbox, restore, save, SANDBOX_ROOT, type SyncResult } from "./sync.js";
+import os from "node:os";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -73,12 +76,14 @@ app.post("/v1/turn", async (req, res) => {
     await resetSandbox();
     send({ type: "status", status: "restoring" });
     manifest = await restore(store, prefix);
+    const extraEnv = await configurePackageMirrors(process.env.HOME ?? os.homedir());
     send({ type: "status", status: "running" });
 
     for await (const ev of runTurn({
       prompt: body.prompt,
       claudeSessionId: body.claudeSessionId,
       ...body.options,
+      extraEnv,
       abortController,
     })) {
       send(ev);
@@ -89,6 +94,9 @@ app.post("/v1/turn", async (req, res) => {
     send({ type: "error", message });
   } finally {
     clearInterval(heartbeat);
+    // エージェントが起動したまま残したプロセス（サーバー等）を止めてから保存する
+    const killed = await killStrayProcesses(SANDBOX_ROOT).catch(() => 0);
+    if (killed) console.log(`killed ${killed} stray process(es)`);
     // 中断・エラーでも途中までの成果は残す（復元に失敗した場合は書き戻さない）
     if (manifest) {
       try {

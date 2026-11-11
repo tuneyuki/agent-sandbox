@@ -45,13 +45,15 @@ variable "turn_timeout_seconds" {
 }
 
 variable "runner_cpu" {
-  type    = string
-  default = "2"
+  description = "ビルド（tsc / npm install / pip install）を行うので 4 以上推奨"
+  type        = string
+  default     = "4"
 }
 
 variable "runner_memory" {
-  type    = string
-  default = "4Gi"
+  description = "Cloud Run のファイルシステムはメモリ上にある。node_modules / .venv もここを消費する"
+  type        = string
+  default     = "8Gi"
 }
 
 variable "runner_min_instances" {
@@ -63,6 +65,12 @@ variable "runner_max_instances" {
   description = "同時に実行できるターン数の上限（= コスト上限の目安）"
   type        = number
   default     = 10
+}
+
+variable "package_mirror" {
+  description = "Artifact Registry のリモートリポジトリで npm / PyPI のミラーを作り、Runner から使えるようにする"
+  type        = bool
+  default     = true
 }
 
 variable "runner_internet_access" {

@@ -173,6 +173,14 @@ resource "google_cloud_run_v2_service" "runner" {
         name  = "MAX_TURNS"
         value = tostring(var.max_agent_turns)
       }
+      env {
+        name  = "NPM_MIRROR_URL"
+        value = local.npm_mirror_url
+      }
+      env {
+        name  = "PYPI_MIRROR_URL"
+        value = local.pypi_mirror_url
+      }
     }
   }
   depends_on = [google_project_service.apis]

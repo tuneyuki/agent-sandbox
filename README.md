@@ -59,6 +59,7 @@ gs://{project}-agent-sandbox-state/
       uploads/               ← API やチャットで渡されたファイル
       ...                    ← エージェントが作ったファイル（ダウンロード可能）
     .state/claude.tar.gz     ← Claude Code の会話記録（内部用）
+    .state/deps.tar.zst      ← node_modules / .venv のアーカイブ（内部用）
 ```
 
 `workspace/` はファイル単位で同期するので、ターンの外からでも API で一覧・アップロード・ダウンロード・削除ができます（実行中は 409 で拒否）。
@@ -68,6 +69,29 @@ gs://{project}-agent-sandbox-state/
 - Runner のサービスアカウントには **バケット権限が一切ありません**（`roles/aiplatform.user` だけ）。
 - Gateway はターンごとに、[Credential Access Boundary](https://cloud.google.com/iam/docs/downscoping-short-lived-credentials) で **`sessions/{id}/` 配下だけ** に絞ったトークンを作って Runner に渡します。
 - エージェントがこのトークンを盗んでも、触れるのは自分のセッションのフォルダだけです。バケットを増やさずに、セッションごとにバケットがあるのと同じ分離になります。
+
+## サンドボックスでのアプリ開発（Python / Node.js）
+
+サンドボックスの中で、アプリを作ってビルド・テスト・実行するところまでできます。
+
+| 項目 | 内容 |
+|---|---|
+| ランタイム | Python 3（`python3` / `python`）、Node.js 22 |
+| パッケージ管理 | npm / pnpm / yarn、pip / uv（`python3 -m venv` も可） |
+| ビルドツール | gcc / make / pkg-config、各種 `-dev` ヘッダー（ネイティブ拡張のビルド用） |
+| その他 | git、curl、jq、ripgrep、sqlite3 |
+
+**パッケージの取得**: Runner はインターネットに出られませんが、Artifact Registry の**リモートリポジトリ**（npmjs と PyPI のプロキシ）経由で `npm install` や `uv pip install` ができます。ターン開始時に Runner の SA のトークンで `~/.npmrc` と `PIP_INDEX_URL` / `UV_DEFAULT_INDEX` を設定するので、エージェントは普段どおりのコマンドを打つだけです。一度取得したパッケージはミラーにキャッシュされます。
+
+**依存の引き継ぎ**: `node_modules/` と `.venv/` はファイル数が多いので、ファイル単位では同期しません。セッションごとに 1 つのアーカイブ（`sessions/{id}/.state/deps.tar.zst`）にまとめて保存します。中身が変わったときだけアップロードし直すので、次のターンでは再インストールなしでビルドやテストができます。`files_changed.deps` が `saved` / `unchanged` / `removed` / `too_large` のどれかで結果を示します。
+
+**実行**: ターンの中で、ビルドとテストに加えて Web サーバーの起動もできます（バックグラウンドで起動し、`curl` で確認する）。Bash のタイムアウトは既定 10 分・最大 30 分に延ばしてあります。ターンが終わると、エージェントが起動したプロセスはすべて停止します。
+
+```bash
+curl -N -XPOST $URL/v1/sessions/$SID/messages "${H[@]}" -H 'content-type: application/json' -d '{
+  "input": "FastAPI で TODO API を作って、pytest でテストし、uvicorn で起動して curl で確認して"
+}'
+```
 
 ## API
 
@@ -117,7 +141,7 @@ gs://{project}-agent-sandbox-state/
 | `tool_use` | `id`, `name`（Bash / Write / Read …）, `input` |
 | `tool_result` | `toolUseId`, `isError`, `content`（4000 文字まで） |
 | `result` | `ok`, `numTurns`, `durationMs`, `costUsd`（セッション累計の推定値） |
-| `files_changed` | `added` / `modified`（`path`, `size`, `url`）, `deleted` |
+| `files_changed` | `added` / `modified`（`path`, `size`, `url`）, `deleted`, `deps` |
 | `error` | `message` |
 | `done` | `turn_id`。ストリーム終了 |
 
@@ -162,10 +186,11 @@ PROJECT_ID=your-project AUTH_MODE=token ./scripts/deploy.sh
 |---|---|---|
 | `auth_mode` / `invoker_members` | `iam` / `[]` | Gateway の認証方式と、呼び出しを許可するメンバー |
 | `claude_model` / `allowed_models` | `claude-opus-5-5` / Opus・Sonnet・Haiku | 既定モデルと、リクエストで選べるモデル |
-| `runner_internet_access` | `false` | `true` で Runner からインターネット（npm / pip / Web）に出られる |
+| `package_mirror` | `true` | npm / PyPI のミラー（Artifact Registry のリモートリポジトリ）を作って Runner から使う |
+| `runner_internet_access` | `false` | `true` で Runner から任意のインターネット（Web・GitHub など）に出られる |
 | `turn_timeout_seconds` | `1800` | 1 ターンの上限（Cloud Run の上限は 3600） |
 | `runner_max_instances` | `10` | 同時に実行できるターン数（コストの上限にもなる） |
-| `runner_cpu` / `runner_memory` | `2` / `4Gi` | サンドボックス 1 つあたりのリソース |
+| `runner_cpu` / `runner_memory` | `4` / `8Gi` | サンドボックス 1 つあたりのリソース（Cloud Run のディスクはメモリ上にあるので、`node_modules` などもメモリを使う） |
 | `state_retention_days` | `30` | GCS 上のセッションフォルダの保持期間 |
 
 ## セキュリティ
@@ -173,16 +198,19 @@ PROJECT_ID=your-project AUTH_MODE=token ./scripts/deploy.sh
 Claude Code の操作を承認する人がいないので、「何をされても被害が限られる」ことを環境側で担保しています。
 
 - **コンテナ**: Runner は Cloud Run（gen2）で `concurrency=1`。ターンごとに `/sandbox` を消去し、非 root で実行する。バックグラウンド実行は無効（`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`）。
-- **ネットワーク**: Runner の通信はすべて VPC を通り、既定では `private.googleapis.com`（Vertex AI・GCS）以外への外向き通信を拒否する。
-- **権限**: Runner の SA は Vertex AI の利用権限だけ。GCS はセッション限定トークン経由でしか触れない。API キーもサンドボックス内に置かない（Vertex AI を SA で呼ぶ）。
+- **ネットワーク**: Runner の通信はすべて VPC を通り、既定では Private Google Access（Vertex AI・GCS・Artifact Registry のパッケージミラー）以外への外向き通信を拒否する。
+- **プロセス**: ターンの最後に、エージェントが起動して残したプロセスを止める（環境変数の印と cwd で判別）。
+- **権限**: Runner の SA は Vertex AI の利用権限と、パッケージミラーの読み取り権限だけ。GCS はセッション限定トークン経由でしか触れない。API キーもサンドボックス内に置かない（Vertex AI を SA で呼ぶ）。
 - **ツール**: `permissionMode: "dontAsk"` + `allowedTools`。許可リスト外のツールは自動で拒否する。`settingSources: []` で外部の設定ファイルを読まない。
 - **Runner への入口**: `INGRESS_TRAFFIC_INTERNAL_ONLY` + IAM（Gateway の SA だけが呼べる）。
 
 ### 既知の制約
 
 - `runner_internet_access=true` にすると、エージェントは任意のサイトと通信できる（データ持ち出しのリスク）。必要なら Secure Web Proxy などで行き先を絞る。
-- 毎ターン、ワークスペース全体をダウンロード・アップロードするので、大きなファイル（数百 MB 以上）を多数置く用途には向かない。`node_modules` などは同期対象から外している（`SYNC_IGNORE_DIRS`）。
-- ターンをまたいだ常駐プロセス（開発サーバーなど）は使えない。必要なら Runner を GKE Sandbox（gVisor）の「セッションごとに Pod」構成に差し替える。Gateway・API・保存形式はそのまま使える。
+- 毎ターン、ワークスペース全体と依存アーカイブを展開するので、大きなファイル（数百 MB 以上）を多数置く用途には向かない。依存アーカイブの上限は 2 GB（`MAX_DEPS_BYTES`）。
+- パッケージミラーは npm と PyPI だけ。`git clone` や、任意の URL からのダウンロード（`curl https://...`、Playwright のブラウザ取得など）は `runner_internet_access=true` にしないとできない。
+- ミラーのパッケージにはマルウェア対策がかからない（公開レジストリの中身をそのまま取る）。被害はサンドボックスと、そのセッションのフォルダの中に限られる。
+- 作ったアプリをユーザーがブラウザで直接触る（プレビュー URL を出す）ことはできない。ターンが終わるとサーバーは止まる。必要なら Runner を GKE Sandbox（gVisor）の「セッションごとに Pod」構成に差し替える。Gateway・API・保存形式はそのまま使える。
 - `costUsd` は SDK の推定値で、請求額ではない。
 
 ## ディレクトリ構成
@@ -198,7 +226,9 @@ runner/src/
   agent.ts     Claude Code の実行とイベントの変換
   sync.ts      セッションフォルダ ⇔ /sandbox の同期
   storage.ts   GCS（セッション限定トークン）/ ローカルのオブジェクト操作
-infra/terraform/                Cloud Run ×2、VPC・ファイアウォール・DNS、GCS、Firestore、IAM
+  packages.ts  npm / PyPI ミラーの設定
+  processes.ts ターン終了時の残存プロセスの停止
+infra/terraform/                Cloud Run ×2、VPC・ファイアウォール・DNS、GCS、Firestore、IAM、パッケージミラー
 integrations/ultra-light-chat/  ultra-light-chat 用アダプタ
 scripts/deploy.sh               ビルドとデプロイ
 docker-compose.yml              ローカル開発用
