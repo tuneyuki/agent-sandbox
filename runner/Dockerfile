@@ -9,12 +9,14 @@ RUN npm run build && npm prune --omit=dev
 
 FROM node:22-bookworm-slim
 # エージェントの開発環境: Python 3 + Node.js 22 + ビルドツール。
+# bubblewrap / socat は Claude Code のコマンド用サンドボックス（Bash の隔離）に使う。
 # 他の言語（Go, Java など）が必要ならここに追加する。
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates git tar gzip zstd xz-utils unzip curl jq ripgrep procps lsof \
       build-essential pkg-config \
       python3 python3-dev python3-pip python3-venv \
       sqlite3 libsqlite3-dev libssl-dev libffi-dev \
+      bubblewrap socat \
     && rm -rf /var/lib/apt/lists/*
 # uv（Python のパッケージ管理）と pnpm / yarn
 RUN pip3 install --no-cache-dir --break-system-packages uv \

@@ -72,6 +72,12 @@ variable "package_mirror" {
   default     = true
 }
 
+variable "command_sandbox" {
+  description = "エージェントが実行するコマンド（と作ったアプリ）を Claude Code のサンドボックスで隔離する。通信はパッケージミラーだけ許可。隔離できない環境ではターンがエラーになる"
+  type        = bool
+  default     = true
+}
+
 variable "gemini_grounding" {
   description = "Gemini の Google Search grounding を Claude Code のツール (mcp__web__google_search) として提供する。有効時は WebSearch / WebFetch を無効にする"
   type        = bool

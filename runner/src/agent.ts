@@ -51,6 +51,48 @@ const BASE_TOOLS = ["Read", "Write", "Edit", "Glob", "Grep", "Bash", "TodoWrite"
 function defaultAllowedTools(): string[] {
   return groundingEnabled() ? [...BASE_TOOLS, GROUNDING_TOOL] : [...BASE_TOOLS, "WebSearch", "WebFetch"];
 }
+/**
+ * Bash で実行するコマンド（そこから起動したアプリも含む）を閉じ込める内側のサンドボックス。
+ * Claude Code 自身（モデル呼び出し）と grounding ツールはこの外側で動くので影響を受けない。
+ *
+ * - ネットワーク: Claude Code のプロキシ経由で、パッケージのミラー（またはレジストリ）だけに出られる。
+ *   メタデータサーバー・Vertex AI・GCS・Gateway には届かない。
+ * - ファイル: 書き込めるのは作業ディレクトリと /tmp だけ。会話記録は読めない。
+ * - 隔離できない環境では、黙って素通りせずエラーにする（failIfUnavailable）。
+ */
+function sandboxAllowedDomains(): string[] {
+  const hosts = new Set<string>();
+  for (const u of [process.env.NPM_MIRROR_URL, process.env.PYPI_MIRROR_URL]) {
+    if (u) hosts.add(new URL(u).hostname);
+  }
+  if (!hosts.size) {
+    // ミラーが無い環境（ローカル開発など）は公式レジストリを許可
+    ["registry.npmjs.org", "pypi.org", "files.pythonhosted.org"].forEach((h) => hosts.add(h));
+  }
+  csv("SANDBOX_EXTRA_ALLOWED_DOMAINS", []).forEach((h) => hosts.add(h));
+  return [...hosts];
+}
+
+function commandSandbox() {
+  if (process.env.COMMAND_SANDBOX !== "1") return undefined;
+  return {
+    enabled: true,
+    failIfUnavailable: true,
+    autoAllowBashIfSandboxed: true,
+    // エージェントが「サンドボックスの外で実行」を選べないようにする
+    allowUnsandboxedCommands: false,
+    network: {
+      allowedDomains: sandboxAllowedDomains(),
+      // 作ったサーバーを localhost で起動して curl で確かめられるように
+      allowLocalBinding: true,
+    },
+    filesystem: {
+      allowWrite: [WORKSPACE_DIR, "/tmp"],
+      denyRead: [CLAUDE_DIR],
+    },
+  };
+}
+
 function defaultDisallowedTools(): string[] {
   return groundingEnabled() ? ["WebSearch", "WebFetch"] : [];
 }
@@ -110,6 +152,16 @@ function agentEnv(extra: Record<string, string> = {}): Record<string, string> {
   return { ...env, ...extra };
 }
 
+const SERVER_NOTE_UNSANDBOXED = `- Web サーバーなどの常駐プロセスは、ログをファイルに出してバックグラウンドで起動し（例: \`nohup python app.py > server.log 2>&1 &\`）、curl で確認してください。ポート 8080 は使用中なので 3000 などを使ってください。`;
+
+const SANDBOX_NOTE = `
+## コマンドの実行環境（隔離あり）
+- Bash のコマンドは 1 回ごとに隔離された環境で実行されます。外部への通信はパッケージのレジストリ（npm / PyPI）だけ許可されていて、それ以外の Web サイトや API には接続できません。これは意図した制限なので、回避しようとしないでください。
+- Web で調べたいことがあるときは google_search ツールを使ってください。
+- バックグラウンドで起動したプロセスは、そのコマンドが終わると止まります。サーバーを確かめるときは、起動・確認・停止を 1 回のコマンドで行ってください。
+  例: \`python3 app.py > server.log 2>&1 & PID=$!; sleep 2; curl -s localhost:3000/todos; kill $PID\`
+- 作ったアプリが外部 API を呼ぶ場合、ここでは実際の通信を確かめられません。モックやテストで確認してください。`.trim();
+
 const SYSTEM_APPEND = `
 あなたはチャットボット経由でユーザーと対話しているサンドボックス内のエージェントです。
 - 作業ディレクトリは ${WORKSPACE_DIR} です。ファイルはここに作成してください。
@@ -123,8 +175,8 @@ const SYSTEM_APPEND = `
 - Python の依存は必ずプロジェクト内の仮想環境に入れてください（例: \`uv venv .venv && uv pip install -r requirements.txt\`、または \`python3 -m venv .venv\`）。システムの Python には入れられません。
 - node_modules/ と .venv/ は次のターンにも引き継がれます。依存を足したら package.json / requirements.txt / pyproject.toml も更新してください。
 - アプリを作ったら、ビルド・テスト・実行まで行って動作を確かめてください。
-- Web サーバーなどの常駐プロセスは、ログをファイルに出してバックグラウンドで起動し（例: \`nohup python app.py > server.log 2>&1 &\`）、curl で確認してください。ポート 8080 は使用中なので 3000 などを使ってください。
 - ターンが終わると起動中のプロセスはすべて停止します。ユーザーから見えるのは作業ディレクトリのファイルと、あなたの回答だけです。実行結果は回答に含めてください。
+${process.env.COMMAND_SANDBOX === "1" ? SANDBOX_NOTE : SERVER_NOTE_UNSANDBOXED}
 `.trim();
 
 function toolResultText(content: unknown): string {
@@ -212,6 +264,7 @@ export async function* runTurn(input: TurnInput): AsyncGenerator<RunnerEvent> {
       allowedTools: csv("ALLOWED_TOOLS", defaultAllowedTools()),
       disallowedTools: csv("DISALLOWED_TOOLS", defaultDisallowedTools()),
       mcpServers: groundingEnabled() ? { web: createGroundingServer() } : {},
+      sandbox: commandSandbox(),
       maxTurns: Number(process.env.MAX_TURNS ?? 50),
       // ユーザー/プロジェクトの settings.json は読まない（再現性のため）
       settingSources: [],

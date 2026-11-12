@@ -193,6 +193,11 @@ resource "google_cloud_run_v2_job" "runner" {
           value = local.pypi_mirror_url
         }
         env {
+          # Bash と、そこから起動したアプリを bubblewrap で隔離し、通信をパッケージミラーだけに絞る
+          name  = "COMMAND_SANDBOX"
+          value = var.command_sandbox ? "1" : "0"
+        }
+        env {
           # Web 検索は Gemini の Google Search grounding だけを使う（サンドボックス自体はインターネット禁止のまま）
           name  = "GROUNDING_ENABLED"
           value = var.gemini_grounding ? "1" : "0"

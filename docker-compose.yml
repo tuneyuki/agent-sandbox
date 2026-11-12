@@ -14,6 +14,12 @@ services:
       # GOOGLE_APPLICATION_CREDENTIALS: /adc.json
       CLAUDE_MODEL: ${CLAUDE_MODEL:-claude-opus-5-5}
       LOCAL_STORE_DIR: /store
+      COMMAND_SANDBOX: "1"
+    # コマンド用サンドボックス（bubblewrap）はユーザー名前空間を作るため、Docker の既定の
+    # seccomp / AppArmor では動かない。ローカル開発用にだけ緩める（本番は Cloud Run Jobs）。
+    security_opt:
+      - seccomp=unconfined
+      - apparmor=unconfined
     volumes:
       - store:/store
       # - ${HOME}/.config/gcloud/application_default_credentials.json:/adc.json:ro

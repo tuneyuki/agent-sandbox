@@ -103,6 +103,29 @@ curl -N -XPOST $URL/v1/sessions/$SID/messages "${H[@]}" -H 'content-type: applic
 }'
 ```
 
+## 2 重の隔離：Claude Code と、エージェントが実行するコマンド
+
+Runner のコンテナの中を、さらに 2 つの層に分けています。
+
+```
+┌──── Runner コンテナ（外へ出られるのは Google API だけ）──────────────┐
+│  Claude Code 本体（モデル呼び出し） ──────────▶ Vertex AI (Claude)        │
+│  google_search ツール ─────────────────────▶ Vertex AI (Gemini + 検索)  │
+│  ┌── コマンド用サンドボックス（bubblewrap）─────────────────────┐  │
+│  │  Bash のコマンド、そこから起動したアプリ                          │  │
+│  │  ・通信: パッケージミラー（npm / PyPI）だけ。プロキシで許可制          │  │
+│  │  ・メタデータサーバー、Vertex AI、GCS、Gateway には届かない          │  │
+│  │  ・書き込めるのは作業ディレクトリと /tmp だけ                       │  │
+│  └─────────────────────────────────────────┘  │
+└────────────────────────────────────────────────┘
+```
+
+- Claude Code の[サンドボックス機能](https://code.claude.com/docs/en/sandboxing)（Agent SDK の `sandbox` オプション）を使います。`allowUnsandboxedCommands: false` なので、エージェントが「サンドボックスの外で実行」を選ぶことはできません。
+- 作ったアプリは外部と通信できません。サービスアカウントのトークン（メタデータサーバー）にも届かないので、Vertex AI を勝手に呼ぶこともできません。
+- Bash のコマンドは 1 回ごとに隔離されます。サーバーの動作確認は「起動・確認・停止」を 1 回のコマンドで行います（エージェントへの指示に含めてある）。
+- 隔離できない環境では、黙って素通りせずにエラーで止まります（`failIfUnavailable`）。
+- Terraform の `command_sandbox`（既定 `true`）で切り替えます。
+
 ## Web 検索（Gemini の Google Search grounding）
 
 サンドボックスはインターネットに出られませんが、**Web を調べる能力だけ** は Gemini の Google Search grounding で渡しています。
@@ -264,6 +287,7 @@ Claude Code の操作を承認する人がいないので、「何をされて�
 
 - **コンテナ**: Runner は Cloud Run Jobs（gen2）。1 実行 = 1 ターンで、終わればコンテナごと消える。非 root で実行する。バックグラウンド実行は無効（`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`）。
 - **ネットワーク**: Runner の通信はすべて VPC を通り、既定では Private Google Access（Vertex AI・GCS・Artifact Registry のパッケージミラー）以外への外向き通信を拒否する。
+- **コマンド**: Bash とそこから起動したアプリは、Claude Code のサンドボックス（bubblewrap）の中で動く。通信はパッケージミラーだけ。
 - **プロセス**: ターンの最後に、エージェントが起動して残したプロセスを止める（環境変数の印と cwd で判別）。
 - **権限**: Runner の SA は Vertex AI の利用権限と、パッケージミラーの読み取り権限だけ。GCS はセッション限定トークン経由でしか触れない。API キーもサンドボックス内に置かない（Vertex AI を SA で呼ぶ）。
 - **ツール**: `permissionMode: "dontAsk"` + `allowedTools`。許可リスト外のツールは自動で拒否する。`settingSources: []` で外部の設定ファイルを読まない。
@@ -278,7 +302,9 @@ Claude Code の操作を承認する人がいないので、「何をされて�
 - ミラーのパッケージにはマルウェア対策がかからない（公開レジストリの中身をそのまま取る）。被害はサンドボックスと、そのセッションのフォルダの中に限られる。
 - 作ったアプリをユーザーがブラウザで直接触る（プレビュー URL を出す）ことはできない。ターンが終わるとサーバーは止まる。必要なら Runner を GKE Sandbox（gVisor）の「セッションごとに Pod」構成に差し替える。Gateway・API・保存形式はそのまま使える。
 - `costUsd` は SDK の推定値で、請求額ではない（Gemini の grounding の費用も含まない）。
-- Runner の SA は Vertex AI を呼べる（Claude を使うために必要）。そのため、エージェントが Bash からメタデータサーバーのトークンを使って Gemini を直接呼び、URL context などのツールで Google 側から任意の URL にアクセスさせることは、理屈の上ではできてしまう（データ持ち出しの経路になり得る）。これは grounding ツールの有無に関係なく、Runner に Vertex AI の権限を与えている時点で存在する。塞ぐには、Runner の SA が呼べるモデルを Anthropic のモデルだけに絞る必要がある（IAM の条件などで実現できるかは要検証）。その場合、Gemini の呼び出しは Gateway 経由に移す。
+- **コマンド用サンドボックスが Cloud Run Jobs で動くかは未検証**。bubblewrap はユーザー名前空間を作れる必要がある。動かない場合はターンがエラーになるので、`command_sandbox=false` にする（コンテナ単位の隔離だけになる）か、Runner を GKE（gVisor）に移す。
+- `command_sandbox=false` のときは、Bash からメタデータサーバーのトークンを取って Vertex AI を直接呼べる。Gemini の URL context などで、Google 側から任意の URL にアクセスさせる経路になり得る。
+- サンドボックス内からも `~/.npmrc` と `PIP_INDEX_URL` にあるパッケージミラー用のトークン（Runner の SA のアクセストークン、1 時間有効）は読める。ただし通信できるのはミラーのホストだけなので、使い道は Artifact Registry の読み取りに限られる。
 - ジョブの起動に毎回数秒〜十数秒かかる（Cloud Run Jobs のコンテナ起動）。短い質問でも、最初の応答まで少し待つ。
 
 ## ディレクトリ構成
