@@ -72,6 +72,23 @@ variable "package_mirror" {
   default     = true
 }
 
+variable "gemini_grounding" {
+  description = "Gemini の Google Search grounding を Claude Code のツール (mcp__web__google_search) として提供する。有効時は WebSearch / WebFetch を無効にする"
+  type        = bool
+  default     = true
+}
+
+variable "grounding_model" {
+  description = "grounding に使う Gemini のモデル（Vertex AI で使えるもの）"
+  type        = string
+  default     = "gemini-2.5-flash"
+}
+
+variable "grounding_location" {
+  type    = string
+  default = "global"
+}
+
 variable "runner_internet_access" {
   description = "true にすると Runner からインターネットへ出られる（npm/pip 等）。既定は Google API のみ"
   type        = bool

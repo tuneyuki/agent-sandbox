@@ -103,6 +103,25 @@ curl -N -XPOST $URL/v1/sessions/$SID/messages "${H[@]}" -H 'content-type: applic
 }'
 ```
 
+## Web 検索（Gemini の Google Search grounding）
+
+サンドボックスはインターネットに出られませんが、**Web を調べる能力だけ** は Gemini の Google Search grounding で渡しています。
+
+- Claude Code に `mcp__web__google_search` というツールを追加します（Runner のプロセス内で動く MCP ツール）。
+- ツールは Vertex AI の Gemini に `tools: [{ googleSearch: {} }]` 付きで問い合わせ、検索結果に基づく回答と出典 URL を返します。
+- Vertex AI には Private Google Access で届くので、サンドボックスから任意のサイトに接続することはありません。検索は Google 側で行われます。
+- 有効なときは Claude Code 標準の `WebSearch` / `WebFetch` を無効にします（`WebFetch` はサンドボックス内から URL を取りに行くため、そもそも使えない）。
+- URL を指定してページを読む機能（Gemini の URL context）は付けていません。任意の URL へのリクエスト経路になるためです。
+- 1 ターンあたりの検索回数に上限があります（`GROUNDING_MAX_CALLS`、既定 20）。Grounding with Google Search は Gemini の利用料とは別に課金されます。
+
+| 変数（Terraform） | 既定値 | 説明 |
+|---|---|---|
+| `gemini_grounding` | `true` | 有効にするか |
+| `grounding_model` | `gemini-2.5-flash` | 使う Gemini のモデル（プロジェクトで使えるものを指定する） |
+| `grounding_location` | `global` | Vertex AI のロケーション |
+
+ローカル開発では `GEMINI_API_KEY` を渡すと、Vertex AI の代わりに Gemini API を使います。
+
 ## API
 
 すべて `x-user-id` ヘッダー（エンドユーザーの ID）を付けて呼びます。セッションはユーザーごとに分かれます。
@@ -258,7 +277,8 @@ Claude Code の操作を承認する人がいないので、「何をされて�
 - パッケージミラーは npm と PyPI だけ。`git clone` や、任意の URL からのダウンロード（`curl https://...`、Playwright のブラウザ取得など）は `runner_internet_access=true` にしないとできない。
 - ミラーのパッケージにはマルウェア対策がかからない（公開レジストリの中身をそのまま取る）。被害はサンドボックスと、そのセッションのフォルダの中に限られる。
 - 作ったアプリをユーザーがブラウザで直接触る（プレビュー URL を出す）ことはできない。ターンが終わるとサーバーは止まる。必要なら Runner を GKE Sandbox（gVisor）の「セッションごとに Pod」構成に差し替える。Gateway・API・保存形式はそのまま使える。
-- `costUsd` は SDK の推定値で、請求額ではない。
+- `costUsd` は SDK の推定値で、請求額ではない（Gemini の grounding の費用も含まない）。
+- Runner の SA は Vertex AI を呼べる（Claude を使うために必要）。そのため、エージェントが Bash からメタデータサーバーのトークンを使って Gemini を直接呼び、URL context などのツールで Google 側から任意の URL にアクセスさせることは、理屈の上ではできてしまう（データ持ち出しの経路になり得る）。これは grounding ツールの有無に関係なく、Runner に Vertex AI の権限を与えている時点で存在する。塞ぐには、Runner の SA が呼べるモデルを Anthropic のモデルだけに絞る必要がある（IAM の条件などで実現できるかは要検証）。その場合、Gemini の呼び出しは Gateway 経由に移す。
 - ジョブの起動に毎回数秒〜十数秒かかる（Cloud Run Jobs のコンテナ起動）。短い質問でも、最初の応答まで少し待つ。
 
 ## ディレクトリ構成
@@ -277,6 +297,7 @@ runner/src/
   sync.ts      セッションフォルダ ⇔ /sandbox の同期
   storage.ts   GCS（セッション限定トークン）/ ローカルのオブジェクト操作
   packages.ts  npm / PyPI ミラーの設定
+  grounding.ts Gemini の Google Search grounding ツール
   processes.ts ターン終了時の残存プロセスの停止
 infra/terraform/                Cloud Run（Gateway）+ Cloud Run Jobs（Runner）、VPC・ファイアウォール・DNS、GCS、Firestore、IAM、パッケージミラー
 integrations/ultra-light-chat/  ultra-light-chat 用アダプタ

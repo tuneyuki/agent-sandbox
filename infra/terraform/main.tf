@@ -193,6 +193,19 @@ resource "google_cloud_run_v2_job" "runner" {
           value = local.pypi_mirror_url
         }
         env {
+          # Web 検索は Gemini の Google Search grounding だけを使う（サンドボックス自体はインターネット禁止のまま）
+          name  = "GROUNDING_ENABLED"
+          value = var.gemini_grounding ? "1" : "0"
+        }
+        env {
+          name  = "GROUNDING_MODEL"
+          value = var.grounding_model
+        }
+        env {
+          name  = "GROUNDING_LOCATION"
+          value = var.grounding_location
+        }
+        env {
           # Gateway が IAM 認証のとき、報告に ID トークンを付ける
           name  = "CALLBACK_USE_ID_TOKEN"
           value = var.auth_mode == "iam" ? "1" : "0"

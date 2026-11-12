@@ -5,6 +5,7 @@
 import { query, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { CLAUDE_DIR, WORKSPACE_DIR } from "./sync.js";
 import { TURN_MARKER } from "./processes.js";
+import { createGroundingServer, groundingEnabled, GROUNDING_TOOL } from "./grounding.js";
 
 /** Runner → Gateway に流すイベント（NDJSON の 1 行 = 1 イベント）。 */
 export type RunnerEvent =
@@ -39,17 +40,20 @@ export interface TurnInput {
   abortController: AbortController;
 }
 
-const DEFAULT_ALLOWED_TOOLS = [
-  "Read",
-  "Write",
-  "Edit",
-  "Glob",
-  "Grep",
-  "Bash",
-  "TodoWrite",
-  "WebSearch",
-  "WebFetch",
-];
+const BASE_TOOLS = ["Read", "Write", "Edit", "Glob", "Grep", "Bash", "TodoWrite"];
+
+/**
+ * Web を調べる手段:
+ * - Gemini grounding が有効なら、それだけを使う（WebSearch / WebFetch は無効にする）。
+ *   WebFetch はサンドボックス内から URL を取りに行くので、インターネット禁止の環境では使えない。
+ * - 無効なら Claude Code 標準の WebSearch / WebFetch（インターネット接続が必要）。
+ */
+function defaultAllowedTools(): string[] {
+  return groundingEnabled() ? [...BASE_TOOLS, GROUNDING_TOOL] : [...BASE_TOOLS, "WebSearch", "WebFetch"];
+}
+function defaultDisallowedTools(): string[] {
+  return groundingEnabled() ? ["WebSearch", "WebFetch"] : [];
+}
 
 function csv(name: string, fallback: string[]): string[] {
   const v = process.env[name];
@@ -205,8 +209,9 @@ export async function* runTurn(input: TurnInput): AsyncGenerator<RunnerEvent> {
       // 誰も承認ボタンを押せないので、許可リスト外のツールは自動拒否する。
       // サンドボックス自体（Cloud Run + VPC egress 制限 + 権限なし SA）で守る前提。
       permissionMode: "dontAsk",
-      allowedTools: csv("ALLOWED_TOOLS", DEFAULT_ALLOWED_TOOLS),
-      disallowedTools: csv("DISALLOWED_TOOLS", []),
+      allowedTools: csv("ALLOWED_TOOLS", defaultAllowedTools()),
+      disallowedTools: csv("DISALLOWED_TOOLS", defaultDisallowedTools()),
+      mcpServers: groundingEnabled() ? { web: createGroundingServer() } : {},
       maxTurns: Number(process.env.MAX_TURNS ?? 50),
       // ユーザー/プロジェクトの settings.json は読まない（再現性のため）
       settingSources: [],
